@@ -1,0 +1,48 @@
+name: cassandra-dbaas-demo
+x-node: &node
+  image: cassandra:5.0.5
+  mem_limit: 1536m
+  environment:
+    CASSANDRA_CLUSTER_NAME: local-dbaas
+    CASSANDRA_DC: dc1
+    CASSANDRA_ENDPOINT_SNITCH: GossipingPropertyFileSnitch
+    CASSANDRA_SEEDS: cassandra1
+    MAX_HEAP_SIZE: 512M
+    HEAP_NEWSIZE: 100M
+  healthcheck:
+    test: [ CMD-SHELL, "cqlsh -e 'SELECT release_version FROM system.local' >/dev/null" ]
+    interval: 15s
+    timeout: 10s
+    retries: 40
+    start_period: 90s
+services:
+  cassandra1:
+    <<: *node
+    ports: [ "127.0.0.1:9042:9042" ]
+    volumes: [ "node1:/var/lib/cassandra" ]
+    networks:
+      cluster: { ipv4_address: 172.28.91.11 }
+  cassandra2:
+    <<: *node
+    ports: [ "127.0.0.1:9043:9042" ]
+    volumes: [ "node2:/var/lib/cassandra" ]
+    depends_on:
+      cassandra1: { condition: service_healthy }
+    networks:
+      cluster: { ipv4_address: 172.28.91.12 }
+  cassandra3:
+    <<: *node
+    ports: [ "127.0.0.1:9044:9042" ]
+    volumes: [ "node3:/var/lib/cassandra" ]
+    depends_on:
+      cassandra2: { condition: service_healthy }
+    networks:
+      cluster: { ipv4_address: 172.28.91.13 }
+volumes:
+  node1:
+  node2:
+  node3:
+networks:
+  cluster:
+    ipam:
+      config: [ { subnet: 172.28.91.0/24 } ]

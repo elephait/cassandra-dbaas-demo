@@ -1,0 +1,6 @@
+.m2/
+target/
+.local/
+
+.idea/
+*.iml
