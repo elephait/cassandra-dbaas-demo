@@ -71,6 +71,9 @@ Prometheus/Grafana, Ansible, Kafka, Kubernetes, and Node.js are not dependencies
 
 ## Profiles and control-plane database
 
+Repair execution now uses a durable SQL-backed queue. See [QUEUE_POC.md](QUEUE_POC.md) for the state model,
+two-instance PostgreSQL setup and real PostgreSQL claim/recovery tests. The default local H2 setup still supports one process.
+
 Configuration is YAML-based. Shared settings are in `application.yml`; environment-specific settings are in
 `application-local.yml`, `application-qa.yml`, and `application-prod.yml`.
 
@@ -133,33 +136,31 @@ reach the addresses advertised by Cassandra directly. For host-based Compose, co
 | POST /operations/{id}/acknowledge | Admin header; releases an UNKNOWN repair after manual verification          |
 
 Collection endpoints default to 50 records and accept `limit=1..200`. `/operations` defaults to
-`activeOnly=true`, which returns `QUEUED`, `RUNNING`, and `UNKNOWN` operations. Item lookup remains
+`activeOnly=true`, which returns `QUEUED`, `CLAIMED`, `RUNNING`, and `UNKNOWN` operations. Item lookup remains
 `/operations/{id}` so collection responses always remain lists and item responses always remain single objects.
 
 The tenant quota caps the number of tenant keyspaces at five by default; it is not a storage/throughput quota. Identifier
 validation prevents CQL injection. Provisioning uses a database transaction and a 60-second ownership lease by default.
+Provisioning validates actual Cassandra replication and the probe table before returning success, including for a tenant
+already recorded as READY. It requires NetworkTopologyStrategy with exactly the configured datacenter/RF and a probe table
+with `id uuid PRIMARY KEY` and `value text`. Schema disagreement returns 503; incompatible or missing schema returns 409.
+An existing RF1 keyspace is rejected before table creation. No replication alteration or destructive reconciliation is performed.
+If external schema drift occurs, the stored tenant record is historical; the provisioning endpoint revalidates the live schema.
 A concurrent request is rejected while that lease is active; after a worker crash or released failed attempt, a retry
 repeats the safe `CREATE ... IF NOT EXISTS` statements and completes the tenant. Configure the lease with
 `DBAAS_PROVISIONING_LEASE_SECONDS`.
 
-Repair requires all three nodes observed UP, uses a database-backed ownership lease, and executes `nodetool repair -pr`
-sequentially on all three nodes for the tenant keyspace. The worker renews its lease periodically. The application
-reconciles an expired repair at startup and before every new repair request by marking its operation `UNKNOWN`. It keeps
-the repair lock held, so an uncertain remote repair cannot overlap with a retry automatically.
+Repair requests require approval and an Idempotency-Key, and are persisted as QUEUED before returning 202.
+Workers poll SQL every two seconds and claim undispatched work atomically. Only one repair executes at a time for this
+single cluster. Claims and lease decisions use database time; replaced owners cannot dispatch or complete old claims.
+Expired CLAIMED work is safely requeued. Expired RUNNING work becomes UNKNOWN and keeps the repair lock because remote
+Cassandra activity may continue. After verifying that the old worker and remote tasks have stopped, explicitly acknowledge
+UNKNOWN through POST /operations/{id}/acknowledge with cassandraActivityVerified=true. Acknowledgement is idempotent and
+records ACKNOWLEDGED. CLI timeouts and failures never cause automatic retry of possibly dispatched work.
 
-An operator means the database administrator or on-call engineer responsible for the Cassandra cluster. For an
-`UNKNOWN` operation, that person must inspect Cassandra logs and `nodetool compactionstats`/`nodetool netstats` on the
-affected nodes and establish that the old repair completed or is no longer active. The acknowledgement is an explicit
-human attestation, not an automated Cassandra check:
-
-```powershell
-$body = '{"cassandraActivityVerified":true}'
-Invoke-RestMethod "http://localhost:8088/operations/<operation-id>/acknowledge" `
-	-Method Post -Headers $admin -ContentType application/json -Body $body
-```
-
-Only after acknowledgement is the global repair lock released and a new repair accepted. The operation remains
-`UNKNOWN` as an audit record, with its detail updated to record the acknowledgement.
+The same Idempotency-Key and approved tenant repair return the original operation; different content returns 409.
+Use a new key for an intentional later repair. Worker preflight requires all expected nodes UP and compatible schema.
+Commands run outside SQL transactions. Full setup, limitations and examples are in [QUEUE_POC.md](QUEUE_POC.md).
 
 ## Cassandra connectivity
 
@@ -188,20 +189,20 @@ fail with 503.
 
 ## Scope
 
-Run one control-plane process from this directory so the default Docker repair command finds the correct project. For
+Run local control-plane processes from this directory so the default Docker repair command finds the correct project. For
 another deployment, set `DBAAS_REPAIR_COMMAND` with `{node}` and `{keyspace}` placeholders. Operation lookup,
 provisioning ownership, and repair ownership survive application restarts through the control-plane database. PostgreSQL
 is required for multiple control-plane servers; file-backed local H2 is not shared.
 
 The control plane intentionally allows one repair at a time because this demo manages one Cassandra cluster. The API
-dispatches repair asynchronously, but increasing its thread pool would not bypass the database repair lock. Independent
+queues repair durably, but increasing its thread pool would not bypass the database repair lock. Independent
 clusters would need a `cluster_id` on operations and one lock per cluster before their repairs could run in parallel.
-`SELECT ... FOR UPDATE SKIP LOCKED` is not used or needed for this single-cluster policy; it would be appropriate for a
-future durable queue with multiple workers claiming independent jobs.
+`SELECT ... FOR UPDATE SKIP LOCKED` now implements durable claims. The shared cluster lock still prevents overlapping
+repairs against this one cluster.
 
 No Spring State Machine is used. The small state model is enforced by conditional SQL ownership transitions. This does
-not provide automatic repair resumption: after a worker is lost, the outcome is deliberately `UNKNOWN` and requires
-manual verification. The acknowledgement endpoint cannot itself prove that remote Cassandra activity stopped. There is
+not automatically retry possibly dispatched work: expired RUNNING work becomes `UNKNOWN` and requires manual verification.
+Undispatched CLAIMED work can be safely requeued. The acknowledgement endpoint cannot prove remote tasks stopped. There is
 also no per-cluster model, external job broker, automatic probe scheduler, rate limiter, authentication beyond the admin
 token, or multi-datacenter repair orchestration. Probes occur only when `/probe` is called; they do not acquire the
 control-plane locks but each call performs a LOCAL_QUORUM write and read.
@@ -217,3 +218,4 @@ docker compose stop  # retains data
 docker compose down # retains volumes
 # docker compose down -v intentionally destroys demo data
 ```
+

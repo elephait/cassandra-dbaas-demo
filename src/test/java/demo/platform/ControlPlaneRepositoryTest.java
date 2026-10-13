@@ -45,11 +45,10 @@ class ControlPlaneRepositoryTest {
         void listsTenantsAndActiveOperations() {
                 var provision = repository.beginProvision("listed", "tenant_listed", 2, Instant.now().plusSeconds(60));
                 repository.completeProvision("listed", provision.owner());
-                var completed = repository.startRepair("tenant_listed", Instant.now().plusSeconds(60));
-                repository.updateOperation(new ControlPlaneRepository.OperationRecord(
+                var completed = claimedRepair("tenant_listed", Instant.now().plusSeconds(60));
+                repository.finishRepair(new ControlPlaneRepository.OperationRecord(
                                 completed.id(), completed.keyspace(), completed.owner(), "SUCCEEDED", "done", Instant.now()));
-                repository.releaseRepair(completed.owner());
-                var active = repository.startRepair("tenant_listed", Instant.now().plusSeconds(60));
+                var active = claimedRepair("tenant_listed", Instant.now().plusSeconds(60));
 
                 assertEquals("listed", repository.listTenants(10).getFirst().id());
                 assertEquals(active.id(), repository.listOperations(true, 10).getFirst().id());
@@ -58,27 +57,37 @@ class ControlPlaneRepositoryTest {
 
     @Test
     void persistsOperationAndPreventsConcurrentRepairLease() {
-        var operation = repository.startRepair("tenant_team", Instant.now().plusSeconds(60));
+        var operation = claimedRepair("tenant_team", Instant.now().plusSeconds(60));
         assertThrows(ControlPlaneRepository.ControlPlaneConflictException.class,
-                () -> repository.startRepair("tenant_other", Instant.now().plusSeconds(60)));
+                () -> claimedRepair("tenant_other", Instant.now().plusSeconds(60)));
 
-        repository.updateOperation(new ControlPlaneRepository.OperationRecord(
+        repository.finishRepair(new ControlPlaneRepository.OperationRecord(
                 operation.id(), operation.keyspace(), operation.owner(), "SUCCEEDED", "done", Instant.now()));
         var stored = repository.getOperation(operation.id());
         assertNotNull(stored);
         assertEquals("SUCCEEDED", stored.state());
-        repository.releaseRepair(operation.owner());
-        assertFalse(repository.startRepair("tenant_other", Instant.now().plusSeconds(60)).id().equals(operation.id()));
+        assertFalse(claimedRepair("tenant_other", Instant.now().plusSeconds(60)).id().equals(operation.id()));
     }
 
         @Test
         void requiresAcknowledgementAfterRepairLeaseExpires() {
-                var operation = repository.startRepair("tenant_team", Instant.now().minusSeconds(1));
+                var operation = claimedRepair("tenant_team", Instant.now().minusSeconds(1));
                 assertEquals(1, repository.reconcileExpiredRepair());
                 assertEquals("UNKNOWN", repository.getOperation(operation.id()).state());
                 assertThrows(ControlPlaneRepository.ControlPlaneConflictException.class,
-                                () -> repository.startRepair("tenant_other", Instant.now().plusSeconds(60)));
+                                () -> claimedRepair("tenant_other", Instant.now().plusSeconds(60)));
                 repository.acknowledgeUnknownRepair(operation.id());
-                assertNotNull(repository.startRepair("tenant_other", Instant.now().plusSeconds(60)));
+                assertNotNull(claimedRepair("tenant_other", Instant.now().plusSeconds(60)));
         }
-}
+    @Autowired org.springframework.jdbc.core.JdbcTemplate queueJdbc;
+    private ControlPlaneRepository.OperationRecord claimedRepair(String keyspace, Instant expiry) {
+        Integer occupied = queueJdbc.queryForObject("SELECT COUNT(*) FROM repair_lock WHERE owner_id IS NOT NULL", Integer.class);
+        if (occupied != null && occupied > 0) throw new ControlPlaneRepository.ControlPlaneConflictException("Repair already running");
+        repository.acceptRepair(keyspace, expiry, java.util.UUID.randomUUID().toString());
+        var op = repository.claimRepair(60);
+        repository.markDispatched(op);
+        queueJdbc.update("UPDATE repair_lock SET expires_at = ? WHERE owner_id = ?", java.sql.Timestamp.from(expiry), op.owner());
+        return repository.getOperation(op.id());
+    }}
+
+

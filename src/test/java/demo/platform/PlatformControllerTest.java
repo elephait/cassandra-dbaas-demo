@@ -11,6 +11,16 @@ import java.util.Map;
 
 class PlatformControllerTest {
     @Test
+    void repairReplayWorksWithoutCassandraAndDoesNotDispatchAgain() {
+        var properties = new CassandraProperties(); properties.setAdminToken("secret");
+        var repairs = org.mockito.Mockito.mock(RepairService.class);
+        var original = new RepairService.Operation(java.util.UUID.randomUUID(), "tenant_team", "SUCCEEDED", "done", java.time.Instant.now());
+        org.mockito.Mockito.when(repairs.replay("tenant_team", "same-key")).thenReturn(original);
+        var controller = new PlatformController(null, repairs, properties, null);
+        assertEquals(original, controller.repair(new PlatformController.RepairRequest("team", true), "secret", "same-key"));
+        org.mockito.Mockito.verify(repairs, org.mockito.Mockito.never()).start(org.mockito.Mockito.anyString(), org.mockito.Mockito.anyString());
+    }
+    @Test
     void translatesEveryDiscoveredReplicaToDistinctHostPort() {
         var translator = new LocalAddressTranslator(Map.of(
             "172.28.91.11", new InetSocketAddress("127.0.0.1", 9042),
@@ -30,7 +40,7 @@ class PlatformControllerTest {
         var controller = new PlatformController(null, null, properties, null);
         assertThrows(org.springframework.web.server.ResponseStatusException.class, () -> controller.provision("team", null));
         assertThrows(org.springframework.web.server.ResponseStatusException.class,
-                () -> controller.repair(new PlatformController.RepairRequest("team", false), "secret"));
+                () -> controller.repair(new PlatformController.RepairRequest("team", false), "secret", "test-key"));
         assertThrows(org.springframework.web.server.ResponseStatusException.class,
             () -> controller.tenants(50, null));
         assertThrows(org.springframework.web.server.ResponseStatusException.class,

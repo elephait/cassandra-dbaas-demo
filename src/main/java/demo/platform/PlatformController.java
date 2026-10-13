@@ -57,13 +57,17 @@ public class PlatformController {
                 Instant.now().plusSeconds(properties.getProvisioningLeaseSeconds()));
         if (!decision.alreadyReady()) {
             try {
+                SchemaValidator.validateKeyspace(session, ks, properties.getDatacenter(), properties.getCassandra().getReplicationFactor(), true);
                 session.execute("CREATE KEYSPACE IF NOT EXISTS " + ks + " WITH replication = {'class':'NetworkTopologyStrategy','" + properties.getDatacenter() + "':" + properties.getCassandra().getReplicationFactor() + "}");
                 session.execute("CREATE TABLE IF NOT EXISTS " + ks + ".probe (id uuid PRIMARY KEY, value text)");
+                SchemaValidator.validate(session, ks, properties.getDatacenter(), properties.getCassandra().getReplicationFactor());
                 controlPlane.completeProvision(id, decision.owner());
             } catch (RuntimeException e) {
                 controlPlane.releaseProvision(id, decision.owner());
                 throw e;
             }
+        } else {
+            SchemaValidator.validate(session, ks, properties.getDatacenter(), properties.getCassandra().getReplicationFactor());
         }
         return Map.of("keyspace", ks, "replicationFactor", properties.getCassandra().getReplicationFactor(), "maxTenants", properties.getMaxTenants());
     }
@@ -95,17 +99,22 @@ public class PlatformController {
     @PostMapping("/cluster/repair")
     @ResponseStatus(HttpStatus.ACCEPTED)
     public RepairService.Operation repair(@RequestBody RepairRequest request,
-                                          @RequestHeader(value = "X-Admin-Token", required = false) String supplied) {
+                                          @RequestHeader(value = "X-Admin-Token", required = false) String supplied,
+                                          @RequestHeader(value = "Idempotency-Key", required = false) String requestKey) {
         authorize(supplied);
         if (!request.approved())
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Explicit approved=true required");
         String ks = keyspace(request.tenant());
+        if (requestKey == null || !requestKey.matches("[A-Za-z0-9._:-]{1,128}"))
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Idempotency-Key required: 1..128 letters, digits, '.', '_', ':', or '-'");
+        var previous = repairs.replay(ks, requestKey);
+        if (previous != null) return previous;
         var session = connections.requireSession();
         if (!session.getMetadata().getKeyspaces().containsKey(com.datastax.oss.driver.api.core.CqlIdentifier.fromInternal(ks)))
             throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Provision tenant first");
         if (session.getMetadata().getNodes().values().stream().filter(n -> n.getState().name().equals("UP")).count() != properties.getCluster().getExpectedNodes())
             throw new ResponseStatusException(HttpStatus.CONFLICT, "All expected nodes must be UP before repair");
-        return repairs.start(ks);
+        return repairs.start(ks, requestKey);
     }
 
     @GetMapping("/operations")

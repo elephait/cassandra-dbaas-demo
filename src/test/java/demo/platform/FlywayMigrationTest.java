@@ -30,7 +30,7 @@ class FlywayMigrationTest {
                 .load()
                 .migrate();
 
-        assertEquals("2", result.targetSchemaVersion);
+        assertEquals("4", result.targetSchemaVersion);
         try (var connection = DriverManager.getConnection(url, "sa", "");
              var columns = connection.getMetaData().getColumns(null, "PUBLIC", "OPERATIONS", "OWNER_ID");
              var statement = connection.prepareStatement("SELECT owner_id FROM operations WHERE operation_id = ?")) {
@@ -43,3 +43,4 @@ class FlywayMigrationTest {
         }
     }
 }
+

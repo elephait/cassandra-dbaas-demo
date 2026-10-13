@@ -35,12 +35,13 @@ try {
     } while ($health.up -ne 3 -and (Get-Date) -lt $deadline)
     if ($health.up -ne 3) { throw 'Node recovery timed out' }
     Probe 'recovered'
+    $headers['Idempotency-Key']=[guid]::NewGuid().ToString()
     $op=Invoke-RestMethod "$BaseUrl/cluster/repair" -Method Post -Headers $headers -ContentType application/json -Body '{"tenant":"interview","approved":true}'
     $deadline=(Get-Date).AddMinutes(46)
     do {
         Start-Sleep -Seconds 3
         $status=Invoke-RestMethod "$BaseUrl/operations/$($op.id)" -Headers $headers
-    } while ($status.state -in @('QUEUED','RUNNING') -and (Get-Date) -lt $deadline)
+    } while ($status.state -in @('QUEUED','CLAIMED','RUNNING') -and (Get-Date) -lt $deadline)
     if ($status.state -ne 'SUCCEEDED') { throw "Repair did not succeed: $($status|ConvertTo-Json -Compress)" }
     Probe 'after-repair'
     Write-Host 'PASS: failure, recovery, and repair verified'
@@ -48,4 +49,5 @@ try {
     if ($stopped) { & docker.exe compose start cassandra3 }
     Pop-Location
 }
+
 
