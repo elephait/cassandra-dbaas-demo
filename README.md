@@ -4,6 +4,71 @@ Java 21+ / Spring Boot control plane for a three-node Cassandra cluster, followi
 the [shared proposal](https://chatgpt.com/share/6acc39ef-d5b4-83e9-8c58-fcfdb3ca69e2). Includes tenant provisioning, RF3
 replication, LOCAL_QUORUM writes and reads, failure/recovery, and approved asynchronous repair.
 
+## Prerequisites and dependencies
+
+### Required for the local demo
+
+| Dependency | Requirement and purpose |
+|------------|-------------------------|
+| JDK | JDK **21 or later**, including `javac`; a JRE alone cannot build the project. Java 25 was used for the verified build. |
+| Apache Maven | Install Maven and put `mvn` on PATH. The project has no Maven wrapper. Maven downloads the Java libraries and builds/tests the executable JAR. |
+| Docker Desktop | Running **Linux container engine**, with the `docker compose` plugin supporting `--wait`. On Windows, use the WSL2 backend with WSL2 installed and hardware virtualization enabled. |
+| PowerShell | Required for `run-local.ps1`, `verify-recovery.ps1`, and the documented `Invoke-RestMethod` commands. |
+| Cassandra | Compose downloads and runs **`cassandra:5.0.5`** on three nodes. No host Cassandra installation is required. |
+| Network access | Required initially for Maven dependencies and the Cassandra Docker image. Configure your proxy if downloads are blocked. Cached dependencies/images allow later offline use. |
+| Local resources | A 16 GiB host with an SSD is the demo target; allocate roughly 8 GiB to Docker/WSL. Each Cassandra container is capped at 1.5 GiB with a 512 MiB heap; the launcher caps the API heap at 384 MiB. Leave disk space for Maven cache, images, Cassandra volumes, and the H2 database. |
+
+Set `JAVA_HOME` to your JDK installation and ensure its `bin` directory, Maven's `bin`, and Docker CLI are on PATH.
+Run from the project directory so relative database paths and Docker Compose repair commands resolve correctly.
+Ports **8088**, **9042**, **9043**, and **9044** must be available. The Docker subnet **172.28.91.0/24** must not overlap
+another local network; changing it also requires updating the configured address-translation mappings.
+
+Check the tools before starting:
+
+```powershell
+java -version
+javac -version
+mvn -version
+docker version
+docker compose version
+docker info
+$PSVersionTable.PSVersion
+```
+
+`mvn -version` shows the actual JDK Maven uses; check that it matches the intended installation.
+`docker info` must include a **Server** section with `OSType: linux`; client information alone does not mean the engine is running.
+If PowerShell blocks scripts, use a policy permitted by your machine's administrator rather than disabling protections globally.
+
+### Java libraries supplied by Maven
+
+These dependencies are declared in `pom.xml` and do not need separate installation:
+
+| Library | Purpose |
+|---------|---------|
+| Spring Boot **4.1.1**, Spring MVC, embedded Tomcat | REST API, configuration, application lifecycle, and HTTP server. |
+| Spring JDBC and HikariCP | SQL control-plane persistence and connection pooling. |
+| Flyway and its PostgreSQL database module | Versioned control-plane schema migrations. |
+| H2 | Embedded file-backed database for the default `local` profile. No standalone H2 service is needed. |
+| PostgreSQL JDBC driver | Connects QA/prod profiles to an external PostgreSQL server. |
+| DataStax Java driver **4.17.0** | Cassandra sessions, topology discovery, consistency, and reconnection. |
+| Lombok | Generates getters, constructors, and logging fields at build time. Its annotation processor is configured explicitly for newer JDKs. |
+| Spring Boot test/JDBC test support | JUnit-based tests and test database support; used by `mvn verify`. |
+
+Spring Boot dependency management supplies versions for libraries without explicit versions in `pom.xml`.
+Cassandra's `nodetool`, `cqlsh`, and Linux shell utilities run **inside the Cassandra containers**, so you do not need
+Python, `nodetool`, `cqlsh`, or a separate Linux shell installed on the Windows host.
+
+### Optional or environment-specific tools
+
+- **PostgreSQL server:** required for QA/prod control-plane profiles, not local. Create a dedicated database/schema and
+  provide `DBAAS_CONTROL_PLANE_JDBC_URL`, `DBAAS_CONTROL_PLANE_DB_USER`, and `DBAAS_CONTROL_PLANE_DB_PASSWORD`.
+  The JDBC driver is bundled, but the database server is not supplied by this Compose file.
+- **Git:** needed to clone, commit, and push the project; not required to run a downloaded copy.
+- **IntelliJ IDEA:** optional for editing/debugging. Enable annotation processing if its own compiler does not generate
+  Lombok members; command-line Maven already configures the processor.
+
+Prometheus/Grafana, Ansible, Kafka, Kubernetes, and Node.js are not dependencies of the current implementation.
+
 ## Profiles and control-plane database
 
 Configuration is YAML-based. Shared settings are in `application.yml`; environment-specific settings are in
@@ -49,7 +114,7 @@ $env:SPRING_PROFILES_ACTIVE='local'
 Each Cassandra container has a 1.5 GiB memory limit and 512 MiB JVM heap. Allow about 8 GiB for Docker/WSL on a 16 GiB
 machine. Startup is sequential to avoid concurrent bootstrap. Volumes preserve node identity/data across stop/start.
 The JAR is deployment-independent: Cassandra contact points, datacenter, replication, expected node count, repair nodes,
-repair command, and optional address translation are configured through `application.properties` or `DBAAS_*` environment
+repair command, and optional address translation are configured through `application.yml` and profile YAML files or `DBAAS_*` environment
 variables. The default values target this local Compose demo. Set `DBAAS_ADDRESS_TRANSLATION_ENABLED=false` when the app can
 reach the addresses advertised by Cassandra directly. For host-based Compose, configure
 `DBAAS_ADDRESS_TRANSLATION_MAPPINGS` as `discovered-host=reachable-host:port,...`.
