@@ -1,5 +1,8 @@
 param([string]$BaseUrl='http://localhost:8088', [string]$AdminToken='local-demo-only')
 $ErrorActionPreference='Stop'
+if ($env:SPRING_PROFILES_ACTIVE -and $env:SPRING_PROFILES_ACTIVE -ne 'local') {
+    throw 'verify-recovery.ps1 is local-only and cannot run with a non-local Spring profile'
+}
 Push-Location $PSScriptRoot
 $stopped=$false
 function Docker([string[]]$Arguments) {
@@ -36,7 +39,7 @@ try {
     $deadline=(Get-Date).AddMinutes(46)
     do {
         Start-Sleep -Seconds 3
-        $status=Invoke-RestMethod "$BaseUrl/operations/$($op.id)"
+        $status=Invoke-RestMethod "$BaseUrl/operations/$($op.id)" -Headers $headers
     } while ($status.state -in @('QUEUED','RUNNING') -and (Get-Date) -lt $deadline)
     if ($status.state -ne 'SUCCEEDED') { throw "Repair did not succeed: $($status|ConvertTo-Json -Compress)" }
     Probe 'after-repair'

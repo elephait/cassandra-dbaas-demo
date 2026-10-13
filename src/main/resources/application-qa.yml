@@ -1,0 +1,12 @@
+spring:
+  datasource:
+    url: ${DBAAS_CONTROL_PLANE_JDBC_URL:jdbc:postgresql://localhost:5432/dbaas}
+    username: ${DBAAS_CONTROL_PLANE_DB_USER:dbaas}
+    password: ${DBAAS_CONTROL_PLANE_DB_PASSWORD:}
+    driver-class-name: org.postgresql.Driver
+
+demo:
+  control-plane:
+    environment: qa
+  address-translation:
+    enabled: ${DBAAS_ADDRESS_TRANSLATION_ENABLED:false}

@@ -4,20 +4,34 @@ import com.datastax.oss.driver.api.core.addresstranslation.AddressTranslator;
 import com.datastax.oss.driver.api.core.context.DriverContext;
 
 import java.net.InetSocketAddress;
+import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Translate Docker discovery addresses into host-published ports.
  */
 public class LocalAddressTranslator implements AddressTranslator {
-    private static final Map<String, Integer> PORTS = Map.of("172.28.91.11", 9042, "172.28.91.12", 9043, "172.28.91.13", 9044);
+    private static final AtomicReference<Map<String, InetSocketAddress>> CONFIGURED_ADDRESSES =
+            new AtomicReference<>(Map.of());
+
+    private final Map<String, InetSocketAddress> addresses;
 
     public LocalAddressTranslator(DriverContext context) {
+        this(CONFIGURED_ADDRESSES.get());
+    }
+
+    public static void configure(Map<String, InetSocketAddress> addresses) {
+        CONFIGURED_ADDRESSES.set(Map.copyOf(new HashMap<>(addresses)));
+    }
+
+    public LocalAddressTranslator(Map<String, InetSocketAddress> addresses) {
+        this.addresses = Map.copyOf(new HashMap<>(addresses));
     }
 
     public InetSocketAddress translate(InetSocketAddress address) {
-        Integer port = PORTS.get(address.getAddress() == null ? address.getHostString() : address.getAddress().getHostAddress());
-        return port == null ? address : new InetSocketAddress("127.0.0.1", port);
+        String host = address.getAddress() == null ? address.getHostString() : address.getAddress().getHostAddress();
+        return addresses.getOrDefault(host, address);
     }
 
     public void close() {

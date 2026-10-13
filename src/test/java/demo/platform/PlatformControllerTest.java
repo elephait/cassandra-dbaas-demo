@@ -3,12 +3,19 @@ package demo.platform;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+
+import java.net.InetSocketAddress;
+import java.util.Map;
 
 class PlatformControllerTest {
     @Test
     void translatesEveryDiscoveredReplicaToDistinctHostPort() {
-        var translator = new LocalAddressTranslator(null);
+        var translator = new LocalAddressTranslator(Map.of(
+            "172.28.91.11", new InetSocketAddress("127.0.0.1", 9042),
+            "172.28.91.12", new InetSocketAddress("127.0.0.1", 9043),
+            "172.28.91.13", new InetSocketAddress("127.0.0.1", 9044)));
         for (int i = 0; i < 3; i++) {
             var result = translator.translate(new java.net.InetSocketAddress("172.28.91." + (11 + i), 9042));
             assertEquals("127.0.0.1", result.getAddress().getHostAddress());
@@ -18,10 +25,18 @@ class PlatformControllerTest {
 
     @Test
     void rejectsUnauthorizedProvisionAndUnapprovedRepairBeforeDatabaseAccess() {
-        var controller = new PlatformController(null, null, 5, "secret");
+        var properties = new CassandraProperties();
+        properties.setAdminToken("secret");
+        var controller = new PlatformController(null, null, properties, null);
         assertThrows(org.springframework.web.server.ResponseStatusException.class, () -> controller.provision("team", null));
         assertThrows(org.springframework.web.server.ResponseStatusException.class,
                 () -> controller.repair(new PlatformController.RepairRequest("team", false), "secret"));
+        assertThrows(org.springframework.web.server.ResponseStatusException.class,
+            () -> controller.tenants(50, null));
+        assertThrows(org.springframework.web.server.ResponseStatusException.class,
+            () -> controller.operations(true, 50, null));
+        assertThrows(org.springframework.web.server.ResponseStatusException.class,
+            () -> controller.operation(java.util.UUID.randomUUID(), null));
     }
 
     @Test
@@ -29,5 +44,33 @@ class PlatformControllerTest {
         for (String value : new String[]{"x; DROP KEYSPACE system", "../x", "", "UPPER", "a".repeat(25)})
             assertThrows(org.springframework.web.server.ResponseStatusException.class, () -> PlatformController.keyspace(value));
         assertEquals("tenant_team_1", PlatformController.keyspace("team_1"));
+    }
+
+    @Test
+    void reportsUnavailableWithoutCassandra() {
+        var properties = new CassandraProperties();
+        properties.getCluster().setExpectedNodes(3);
+        var connections = new CassandraConnectionManager(properties);
+        var controller = new PlatformController(connections, null, properties, null);
+
+        var health = controller.health();
+
+        assertEquals("UNAVAILABLE", health.get("status"));
+        assertFalse((boolean) health.get("quorumAvailable"));
+        assertThrows(org.springframework.web.server.ResponseStatusException.class,
+                () -> connections.requireSession());
+        connections.close();
+    }
+
+    @Test
+    void rejectsUnboundedCollectionRequests() {
+        var properties = new CassandraProperties();
+        properties.setAdminToken("secret");
+        var controller = new PlatformController(null, null, properties, null);
+
+        assertThrows(org.springframework.web.server.ResponseStatusException.class,
+                () -> controller.tenants(201, "secret"));
+        assertThrows(org.springframework.web.server.ResponseStatusException.class,
+                () -> controller.operations(true, 0, "secret"));
     }
 }

@@ -1,0 +1,10 @@
+spring:
+  datasource:
+    url: jdbc:h2:file:./.local/control-plane;DB_CLOSE_ON_EXIT=FALSE
+    username: sa
+    password:
+    driver-class-name: org.h2.Driver
+
+demo:
+  control-plane:
+    environment: local

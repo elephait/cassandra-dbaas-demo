@@ -1,0 +1,36 @@
+server:
+  port: 8088
+  address: 127.0.0.1
+
+spring:
+  profiles:
+    default: local
+  datasource:
+    hikari:
+      maximum-pool-size: 10
+  sql:
+    init:
+      mode: never
+  flyway:
+    baseline-on-migrate: true
+    baseline-version: 1
+
+demo:
+  contact-points: ${DBAAS_CONTACT_POINTS:127.0.0.1:9042,127.0.0.1:9043,127.0.0.1:9044}
+  datacenter: ${DBAAS_DATACENTER:dc1}
+  cluster:
+    expected-nodes: ${DBAAS_EXPECTED_NODES:3}
+  cassandra:
+    replication-factor: ${DBAAS_REPLICATION_FACTOR:3}
+    request-timeout-seconds: ${DBAAS_REQUEST_TIMEOUT_SECONDS:10}
+    reconnect-seconds: ${DBAAS_RECONNECT_SECONDS:60}
+  address-translation:
+    enabled: ${DBAAS_ADDRESS_TRANSLATION_ENABLED:true}
+    mappings: ${DBAAS_ADDRESS_TRANSLATION_MAPPINGS:172.28.91.11=127.0.0.1:9042,172.28.91.12=127.0.0.1:9043,172.28.91.13=127.0.0.1:9044}
+  repair:
+    nodes: ${DBAAS_REPAIR_NODES:cassandra1,cassandra2,cassandra3}
+    command: ${DBAAS_REPAIR_COMMAND:docker compose exec -T {node} nodetool repair -pr {keyspace}}
+    lease-minutes: ${DBAAS_REPAIR_LEASE_MINUTES:60}
+  provisioning-lease-seconds: ${DBAAS_PROVISIONING_LEASE_SECONDS:60}
+  max-tenants: ${DBAAS_MAX_TENANTS:5}
+  admin-token: ${DBAAS_ADMIN_TOKEN:local-demo-only}

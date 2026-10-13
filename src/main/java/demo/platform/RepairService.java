@@ -1,81 +1,112 @@
 package demo.platform;
 
 import jakarta.annotation.PreDestroy;
+import lombok.RequiredArgsConstructor;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.event.EventListener;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.web.server.ResponseStatusException;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
 import java.time.Instant;
 import java.util.List;
-import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 @Service
+@RequiredArgsConstructor
 public class RepairService {
-    private final Map<UUID, Operation> operations = new ConcurrentHashMap<>();
-    private final AtomicBoolean busy = new AtomicBoolean();
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
+    private final ScheduledExecutorService leaseWorker = Executors.newSingleThreadScheduledExecutor();
+    private final CassandraProperties properties;
+    private final ControlPlaneRepository controlPlane;
 
     public Operation start(String ks) {
-        if (!busy.compareAndSet(false, true))
-            throw new ResponseStatusException(HttpStatus.CONFLICT, "Repair already running");
-        UUID id = UUID.randomUUID();
-        Operation queued = new Operation(id, ks, "QUEUED", "Approved repair queued", Instant.now());
-        operations.put(id, queued);
-        worker.submit(() -> {
-            try {
-                update(id, ks, "RUNNING", "Repairing primary ranges sequentially on all nodes");
-                Files.createDirectories(Path.of(".local", "operations"));
-                for (String node : List.of("cassandra1", "cassandra2", "cassandra3")) {
-                    Path log = Path.of(".local", "operations", id + "-" + node + ".log");
-                    Process process = new ProcessBuilder("docker", "compose", "exec", "-T", node, "nodetool", "repair", "-pr", ks)
-                            .redirectErrorStream(true).redirectOutput(log.toFile()).start();
-                    if (!process.waitFor(15, TimeUnit.MINUTES)) {
-                        process.destroyForcibly();
-                        throw new IllegalStateException("CLI timeout on " + node + "; remote repair may still run. Inspect nodetool before retrying");
-                    }
-                    if (process.exitValue() != 0)
-                        throw new IllegalStateException("Repair failed on " + node + "; see " + log);
-                }
-                update(id, ks, "SUCCEEDED", "All three primary-range repairs completed");
-            } catch (Exception e) {
-                update(id, ks, "FAILED", e.getMessage());
-            } finally {
-                busy.set(false);
-            }
-        });
-        return queued;
+        controlPlane.reconcileExpiredRepair();
+        var record = controlPlane.startRepair(ks, Instant.now().plusSeconds(properties.getRepair().getLeaseMinutes() * 60L));
+        try {
+            worker.submit(() -> run(record));
+        } catch (RuntimeException e) {
+            controlPlane.updateOperation(new ControlPlaneRepository.OperationRecord(record.id(), ks, record.owner(), "FAILED", e.getMessage(), Instant.now()));
+            controlPlane.releaseRepair(record.owner());
+            throw e;
+        }
+        return toOperation(record);
     }
 
-    private void update(UUID id, String ks, String state, String detail) {
-        Operation op = new Operation(id, ks, state, String.valueOf(detail), Instant.now());
-        operations.put(id, op);
+    private void run(ControlPlaneRepository.OperationRecord queued) {
+        UUID id = queued.id();
+        String ks = queued.keyspace();
+        long leaseSeconds = properties.getRepair().getLeaseMinutes() * 60L;
+        long heartbeatSeconds = Math.max(1, leaseSeconds / 3);
+        ScheduledFuture<?> heartbeat = leaseWorker.scheduleAtFixedRate(
+            () -> controlPlane.renewRepair(queued.owner(), Instant.now().plusSeconds(leaseSeconds)),
+            heartbeatSeconds, heartbeatSeconds, TimeUnit.SECONDS);
         try {
+            update(queued, "RUNNING", "Repairing primary ranges sequentially on all nodes");
             Files.createDirectories(Path.of(".local", "operations"));
-            Files.writeString(Path.of(".local", "operations", id + ".txt"), op + System.lineSeparator(), StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+            for (String node : properties.getRepair().getNodes().split(",")) {
+                Path log = Path.of(".local", "operations", id + "-" + node + ".log");
+                String command = properties.getRepair().getCommand().replace("{node}", node.trim()).replace("{keyspace}", ks);
+                Process process = new ProcessBuilder(command.trim().split("\\s+"))
+                        .redirectErrorStream(true).redirectOutput(log.toFile()).start();
+                if (!process.waitFor(15, TimeUnit.MINUTES)) {
+                    process.destroyForcibly();
+                    throw new IllegalStateException("CLI timeout on " + node + "; remote repair may still run. Inspect nodetool before retrying");
+                }
+                if (process.exitValue() != 0)
+                    throw new IllegalStateException("Repair failed on " + node + "; see " + log);
+            }
+            update(queued, "SUCCEEDED", "All configured primary-range repairs completed");
         } catch (Exception e) {
-            System.err.println("Audit write failed: " + e.getMessage());
+            update(queued, "FAILED", e.getMessage());
+        } finally {
+            heartbeat.cancel(false);
+            controlPlane.releaseRepair(queued.owner());
         }
     }
 
+    @EventListener(ApplicationReadyEvent.class)
+    void reconcileAfterStartup() {
+        controlPlane.reconcileExpiredRepair();
+    }
+
+    private void update(ControlPlaneRepository.OperationRecord previous, String state, String detail) {
+        controlPlane.updateOperation(new ControlPlaneRepository.OperationRecord(
+                previous.id(), previous.keyspace(), previous.owner(), state, String.valueOf(detail), Instant.now()));
+    }
+
+    private static Operation toOperation(ControlPlaneRepository.OperationRecord record) {
+        return new Operation(record.id(), record.keyspace(), record.state(), record.detail(), record.updated());
+    }
+
     public Operation get(UUID id) {
-        Operation op = operations.get(id);
-        if (op == null)
-            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Unknown operation (status memory resets on restart)");
-        return op;
+        var operation = controlPlane.getOperation(id);
+        if (operation == null)
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Unknown operation");
+        return toOperation(operation);
+    }
+
+    public List<Operation> list(boolean activeOnly, int limit) {
+        return controlPlane.listOperations(activeOnly, limit).stream().map(RepairService::toOperation).toList();
+    }
+
+    public Operation acknowledge(UUID id) {
+        controlPlane.reconcileExpiredRepair();
+        controlPlane.acknowledgeUnknownRepair(id);
+        return get(id);
     }
 
     @PreDestroy
     void close() {
         worker.shutdown();
+        leaseWorker.shutdown();
     }
 
     public record Operation(UUID id, String keyspace, String state, String detail, Instant updated) {
