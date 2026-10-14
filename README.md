@@ -45,7 +45,15 @@ Invoke-RestMethod "$base/clusters/default/keyspaces/interview/probe" `
 Submit a repair and observe its durable status:
 
 ```powershell
-$admin['Idempotency-Key'] = [guid]::NewGuid().ToString()
+$base = 'http://localhost:8088'
+$admin = @{
+    'X-Admin-Token' = 'local-demo-only'
+    'Idempotency-Key' = [guid]::NewGuid().ToString()
+}
+
+# Provision or revalidate the keyspace before requesting repair.
+Invoke-RestMethod "$base/clusters/default/keyspaces/interview" -Method Post -Headers $admin
+
 $body = '{"keyspace":"interview","approved":true}'
 $op = Invoke-RestMethod "$base/clusters/default/repair" `
   -Method Post -Headers $admin -ContentType application/json -Body $body
@@ -56,22 +64,27 @@ do {
 } while ($status.state -in @('QUEUED','CLAIMED','RUNNING'))
 ```
 
-Replaying the same request/key returns the same operation; different content with that key is rejected.
+Both examples initialize their variables and can be run independently in a new PowerShell session. Use your configured
+admin token if it differs from `local-demo-only`.
+
+When retrying a lost repair response, rerun only the repair request using the existing `$admin` headers; do not generate
+a new idempotency key. Replaying the same request/key returns the same operation; different content with that key is
+rejected. Generate a new key only for a new repair.
 The worker runs `docker compose exec -T {node} nodetool repair -pr interview` on each configured node.
 Inspect `.local/operations/` for command logs. The expected successful terminal state is `SUCCEEDED`.
 
 ## The guardrails
 
-| Concern | Enforced behavior |
-|---|---|
-| Duplicate submission | A cluster-scoped idempotency key identifies one durable request. |
-| Concurrent repairs | One active repair per registered cluster; independent clusters can run in parallel. |
-| Competing replicas | Transactional claims with `FOR UPDATE SKIP LOCKED`; shared PostgreSQL owns coordination. |
-| Stale workers | Owner and unexpired lease checks fence dispatch decisions and SQL completion; leases use database time. |
-| Unsafe admission | Explicit approval, valid identifiers, enabled cluster, expected nodes UP, and compatible schema. |
-| Configuration changes | Changes are blocked while repair work is pending or a provisioning lease is active. |
-| Overload/outage | Bounded worker/connection pools, queue cap of 1,000 per cluster, and persisted retry backoff. |
-| Partial completion | Completion and lease release commit together; uncertain remote work retains exclusion. |
+| Concern               | Enforced behavior                                                                                       |
+|-----------------------|---------------------------------------------------------------------------------------------------------|
+| Duplicate submission  | A cluster-scoped idempotency key identifies one durable request.                                        |
+| Concurrent repairs    | One active repair per registered cluster; independent clusters can run in parallel.                     |
+| Competing replicas    | Transactional claims with `FOR UPDATE SKIP LOCKED`; shared PostgreSQL owns coordination.                |
+| Stale workers         | Owner and unexpired lease checks fence dispatch decisions and SQL completion; leases use database time. |
+| Unsafe admission      | Explicit approval, valid identifiers, enabled cluster, expected nodes UP, and compatible schema.        |
+| Configuration changes | Changes are blocked while repair work is pending or a provisioning lease is active.                     |
+| Overload/outage       | Bounded worker/connection pools, queue cap of 1,000 per cluster, and persisted retry backoff.           |
+| Partial completion    | Completion and lease release commit together; uncertain remote work retains exclusion.                  |
 
 **SQL fencing cannot stop a command already running in Cassandra. There is no exactly-once remote execution guarantee.**
 Each physical Cassandra cluster must have one registry identity; aliases would bypass per-cluster exclusion.
@@ -81,30 +94,35 @@ The admin token is a local-demo access gate, not production identity management.
 
 ```mermaid
 flowchart LR
-  Operator --> API[Cluster / Keyspace / RepairCoordinator]
-  API --> SQL[(PostgreSQL: metadata, queue, leases)]
-  SQL --> Worker[RepairWorker on each replica]
-  API --> Sessions[Versioned session per cluster]
-  Sessions --> Cassandra[(Cassandra data plane)]
-  Worker --> CLI[nodetool repair]
-  CLI --> Cassandra
+    Operator --> API[Cluster / Keyspace / RepairCoordinator]
+    API --> SQL[(PostgreSQL: metadata, queue, leases)]
+    SQL --> Worker[RepairWorker on each replica]
+    API --> Sessions[Versioned session per cluster]
+    Sessions --> Cassandra[(Cassandra data plane)]
+    Worker --> CLI[nodetool repair]
+    CLI --> Cassandra
 ```
 
 - **Separate control and data planes:** SQL is the coordination authority; Cassandra stores application data.
-- **Keep transactions short:** commit admission/ownership before remote calls. No distributed transaction spans SQL and Cassandra.
-- **Scale by independent work:** stateless APIs and shared durable state; cluster locks serialize only that cluster's repairs.
-- **Use one authority:** no broker or distributed cache is needed for this POC. Ownership decisions always come from SQL.
-- **Contain dependency failures:** a disconnected cluster does not block other clusters; delayed work backs off rather than occupying workers.
+- **Keep transactions short:** commit admission/ownership before remote calls. No distributed transaction spans SQL and
+  Cassandra.
+- **Scale by independent work:** stateless APIs and shared durable state; cluster locks serialize only that cluster's
+  repairs.
+- **Use one authority:** no broker or distributed cache is needed for this POC. Ownership decisions always come from
+  SQL.
+- **Contain dependency failures:** a disconnected cluster does not block other clusters; delayed work backs off rather
+  than occupying workers.
 
 Repair lifecycle: `QUEUED → CLAIMED → RUNNING → SUCCEEDED`.
+An undispatched claim whose policy no longer matches, or whose policy row is gone, is closed as `FAILED`.
 `RUNNING` is persisted **before** invoking a remote command, so a crash can leave its outcome uncertain.
 
-| Failure point | Recovery |
-|---|---|
-| Before dispatch | Safe retry with persisted backoff; expired CLAIMED work returns to QUEUED. |
-| After possible dispatch | Record UNKNOWN; expired RUNNING work also becomes UNKNOWN. No automatic replay. |
-| Operator reconciliation | Stop/fence the old worker and inspect remote repair activity, then acknowledge to release exclusion. |
-| Keyspace creation interrupted | Release/expire ownership; caller retries idempotent DDL and schema validation. |
+| Failure point                 | Recovery                                                                                             |
+|-------------------------------|------------------------------------------------------------------------------------------------------|
+| Before dispatch               | Safe retry with persisted backoff; expired CLAIMED work returns to QUEUED.                           |
+| After possible dispatch       | Record UNKNOWN; expired RUNNING work also becomes UNKNOWN. No automatic replay.                      |
+| Operator reconciliation       | Stop/fence the old worker and inspect remote repair activity, then acknowledge to release exclusion. |
+| Keyspace creation interrupted | Release/expire ownership; caller retries idempotent DDL and schema validation.                       |
 
 Acknowledgement uses `POST /operations/{id}/acknowledge` with `{"cassandraActivityVerified":true}`.
 It records `ACKNOWLEDGED`; it neither cancels remote work nor proves the repair succeeded.
@@ -118,7 +136,8 @@ With the local application running:
 ./verify-recovery.ps1
 ```
 
-This script stops one node, proves quorum writes/reads, starts the node, verifies recovery, and explicitly requests repair.
+This script stops one node, proves quorum writes/reads, starts the node, verifies recovery, and explicitly requests
+repair.
 **The script restarts the node; the Java application does not.** All four phases perform 20 write/read checks.
 
 For a two-replica demonstration, use a disposable PostgreSQL database:
@@ -136,25 +155,14 @@ The smoke script launches/stops two JVMs, checks cross-replica idempotency, and 
 `verify-system.ps1` launches/stops another test server and checks authentication, validation, configuration replay,
 provisioning, quota, disabled/unavailable clusters, session isolation, and node recovery.
 
-Automated tests, including PostgreSQL worker contention and recovery:
-
-```powershell
-docker exec dbaas-poc-postgres createdb -U postgres queue_test
-$env:DBAAS_QUEUE_TEST_JDBC_URL = 'jdbc:postgresql://localhost:15433/queue_test'
-mvn clean verify
-Remove-Item Env:DBAAS_QUEUE_TEST_JDBC_URL
-docker stop dbaas-poc-postgres
-```
-
-Verified locally: **40 tests passed, none skipped**, two application replicas completed a real repair,
-and 80 quorum write/read checks passed through healthy, down-node, recovery, and post-repair phases.
-An initial provisioning request returned 503 during schema convergence; an explicit retry completed successfully.
-
 ## POC boundaries and next decisions
 
 This is a coordination demonstration, not a production DBaaS. It has no node lifecycle management, automatic repair
-on node recovery, backup/restore, or production authentication. Driver health and probes are not a full data-integrity audit.
-Next priorities: observable provisioning failures/reconciliation, operation retention/metrics, and production access control.
-Fleet scale needs measurement and session assignment/sharding: every replica currently connects to every enabled cluster.
+on node recovery, backup/restore, or production authentication. Driver health and probes are not a full data-integrity
+audit.
+Next priorities: observable provisioning failures/reconciliation, operation retention/metrics, and production access
+control.
+Fleet scale needs measurement and session assignment/sharding: every replica currently connects to every enabled
+cluster.
 Load/soak testing, disk-loss recovery, and killing a worker during real remote repair were not exercised.
 Stop the local application with Ctrl+C; `docker compose down` stops Cassandra while preserving its data volumes.

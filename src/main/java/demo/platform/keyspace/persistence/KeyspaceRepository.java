@@ -10,6 +10,7 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Repository;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.annotation.Isolation;
 
 import java.time.Instant;
 import java.util.List;
@@ -21,17 +22,18 @@ public class KeyspaceRepository {
     private final KeyspaceJpaRepository keyspaces;
     private final ClusterRepository clusters;
 
-    @Transactional
+    @Transactional(isolation = Isolation.READ_COMMITTED)
     public ProvisionDecision begin(String clusterId, String keyspace, int maxKeyspaces, int leaseSeconds) {
         return begin(clusterId, keyspace, maxKeyspaces, leaseSeconds, -1);
     }
 
-    @Transactional
+    @Transactional(isolation = Isolation.READ_COMMITTED)
     public ProvisionDecision begin(String clusterId, String keyspace, int maxKeyspaces, int leaseSeconds,
                                    long expectedConfigVersion) {
         KeyspaceNames.validate(keyspace);
         if (leaseSeconds < 3) throw new IllegalArgumentException("Provisioning lease must be at least three seconds");
-        // Serializes admission and quota reservation across replicas, including absent keyspaces.
+        // Lock before counting: READ_COMMITTED observes the preceding owner's committed reservation.
+        // This serializes same-cluster admission across replicas, including absent keyspaces.
         clusters.lockEnabled(clusterId);
         if (expectedConfigVersion >= 0 && clusters.get(clusterId).configVersion() != expectedConfigVersion)
             throw new ControlPlaneExceptions.Conflict("Cluster configuration changed before provisioning admission; retry");

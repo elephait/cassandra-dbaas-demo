@@ -1,0 +1,29 @@
+name: Provisioning and queue integration
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+          cache-path: .m2
+      - name: Run unit and Testcontainers integration tests
+        run: mvn -B -Pintegration verify
+      - name: Test diagnostics
+        if: failure()
+        run: |
+          docker ps -a
+          find target -name '*.txt' -path '*reports*' -exec cat {} +

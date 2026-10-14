@@ -66,6 +66,8 @@ class RepairQueueTest {
     RepairPolicyRepository policies;
     @Autowired
     JdbcTemplate jdbc;
+    @Autowired
+    jakarta.persistence.EntityManager entityManager;
 
     private static ClusterRecord cluster(String id) {
         return new ClusterRecord(id, List.of(new ContactPoint(id + ".example", 9042)),
@@ -139,5 +141,21 @@ class RepairQueueTest {
     private void expire(OperationRecord operation) {
         jdbc.update("UPDATE repair_locks SET expires_at = ? WHERE owner_id = ?",
             java.sql.Timestamp.from(Instant.now().minusSeconds(60)), operation.owner());
+    }
+
+    @Test
+    void queuedWorkThatCanNoLongerBeAdmittedFailsVisiblyInsteadOfStalling() {
+        queue.accept("default", "team", "stale-policy");
+        // Replace the policy version underneath the accepted operation, as an out-of-band policy
+        // rewrite would, and drop the first-level cache so the claim reads it.
+        jdbc.update("UPDATE repair_policies SET policy_version = policy_version + 1 WHERE cluster_id = 'default'");
+        entityManager.clear();
+
+        assertNull(execution.claim(60));
+
+        var stalled = queue.get(queue.list("default", false, 10).getFirst().id());
+        assertEquals(RepairState.FAILED, stalled.state());
+        assertTrue(stalled.detail().contains("policy version"));
+        assertNull(jdbc.queryForObject("SELECT owner_id FROM repair_locks WHERE cluster_id = 'default'", String.class));
     }
 }

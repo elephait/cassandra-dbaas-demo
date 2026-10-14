@@ -96,10 +96,17 @@ public class RepairWorker {
             heartbeat = leaseWorker.scheduleAtFixedRate(() -> renewLease(operation, leaseSeconds, lost),
                 heartbeatSeconds, heartbeatSeconds, TimeUnit.SECONDS);
             Files.createDirectories(Path.of(".local", "operations"));
+            boolean dispatched = false;
             for (String node : policy.nodes()) {
+                // Admission is re-checked before every node, but RUNNING is persisted only once,
+                // before the first remote command. Repeating that transition per node would rely on
+                // the database reporting a matched row when nothing but time has changed.
                 assertDispatchAllowed(operation, lost);
                 validateClusterForDispatch(operation, cluster);
-                execution.markDispatched(operation);
+                if (!dispatched) {
+                    execution.markDispatched(operation);
+                    dispatched = true;
+                }
                 String command = policy.command().replace("{node}", node)
                     .replace("{keyspace}", operation.keyspace());
                 commandRunner.execute(command,

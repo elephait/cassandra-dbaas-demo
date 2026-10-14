@@ -2,6 +2,8 @@ package demo.platform;
 
 import demo.platform.cluster.persistence.ClusterRepository;
 import demo.platform.misc.ApiExceptionHandler;
+import demo.platform.misc.CassandraConnectionManager;
+import demo.platform.cluster.ClusterRecord;
 import demo.platform.misc.ControlPlaneExceptions;
 import demo.platform.repair.OperationRecord;
 import demo.platform.repair.OperationRecord.RepairPolicy;
@@ -22,6 +24,7 @@ import java.time.Instant;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.*;
 
 @DataJpaTest
 @Import({ClusterRepository.class,     RepairQueueRepository.class, RepairExecutionRepository.class})
@@ -52,9 +55,33 @@ class RepairSafetyTest {
         }
     }
 
+    @Test
+    void persistsRunningExactlyOnceAndOnlyBeforeTheFirstNodeRuns() {
+        policies.save(new RepairPolicy("default",
+            java.util.List.of("node1", "node2", "node3"), "noop {node} {keyspace}", 1, 0));
+        queue.accept("default", "sequence", UUID.randomUUID().toString());
+        var operation = execution.claim(60);
+        java.util.List<String> states = new java.util.ArrayList<>();
+        var runner = new RepairCommandRunner() {
+            @Override
+            public void execute(String command, Path output) {
+                states.add(queue.get(operation.id()).state().name());
+            }
+        };
+        var properties = new ApiExceptionHandler.CassandraProperties();
+        properties.getRepair().setWorkerThreads(1);
+        var service = new RepairWorker(properties, clusters, execution, policies, null, runner);
+        try {
+            service.run(operation);
+            assertEquals(java.util.List.of("RUNNING", "RUNNING", "RUNNING"), states);
+            assertEquals(RepairState.SUCCEEDED, queue.get(operation.id()).state());
+        } finally {
+            service.close();
+        }
+    }
+
     @Autowired
-    ClusterRepository clusters;
-    @Autowired
+    ClusterRepository clusters;    @Autowired
     RepairQueueRepository queue;
     @Autowired
     RepairExecutionRepository execution;
@@ -96,13 +123,38 @@ class RepairSafetyTest {
     }
 
     @Test
-    void failedTerminalWriteDoesNotReleaseOwnership() {
+    void oversizedTerminalDetailIsBoundedAndStillReleasesOwnership() {
         var operation = claimedRepair("team", Instant.now().plusSeconds(60));
-        assertThrows(org.springframework.dao.DataIntegrityViolationException.class,
-            () -> execution.finish(terminal(operation, "x".repeat(5000))));
-        assertEquals(RepairState.RUNNING, queue.get(operation.id()).state());
-        assertThrows(ControlPlaneExceptions.Conflict.class,
-            () -> claimedRepair("other", Instant.now().plusSeconds(60)));
+        execution.finish(terminal(operation, "x".repeat(5000)));
+        var finished = queue.get(operation.id());
+        assertEquals(RepairState.SUCCEEDED, finished.state());
+        assertTrue(finished.detail().length() <= 3900, "detail must fit operations.detail");
+        assertNull(jdbc.queryForObject("SELECT owner_id FROM repair_locks WHERE cluster_id = 'default'", String.class));
+    }
+
+    @Test
+    void failureBeforeAnyNodeRunsRequeuesInsteadOfBurningTheRepair() {
+        var properties = new ApiExceptionHandler.CassandraProperties();
+        properties.getRepair().setWorkerThreads(1);
+        var connections = mock(CassandraConnectionManager.class);
+        when(connections.requireSession(any(ClusterRecord.class)))
+            .thenThrow(new IllegalStateException("Cassandra unavailable before dispatch"));
+        var runner = mock(RepairCommandRunner.class);
+        var service = new RepairWorker(properties, clusters, execution, policies, connections, runner);
+        queue.accept("default", "before_dispatch", UUID.randomUUID().toString());
+        var operation = execution.claim(60);
+        try {
+            service.run(operation);
+            var deferred = queue.get(operation.id());
+            assertEquals(RepairState.QUEUED, deferred.state());
+            verifyNoInteractions(runner);
+            assertNull(deferred.owner());
+            assertEquals(1, jdbc.queryForObject("SELECT retry_count FROM operations WHERE operation_id = ?",
+                Integer.class, operation.id().toString()));
+            assertNull(jdbc.queryForObject("SELECT owner_id FROM repair_locks WHERE cluster_id = 'default'", String.class));
+        } finally {
+            service.close();
+        }
     }
 
     private RepairWorker serviceThatTimesOut() {

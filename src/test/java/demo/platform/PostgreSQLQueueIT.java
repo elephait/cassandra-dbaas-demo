@@ -12,7 +12,9 @@ import demo.platform.repair.persistence.RepairPolicyRepository;
 import demo.platform.repair.persistence.RepairQueueRepository;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
+import org.testcontainers.junit.jupiter.Testcontainers;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.postgresql.PostgreSQLContainer;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
@@ -29,8 +31,12 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
-@EnabledIfEnvironmentVariable(named = "DBAAS_QUEUE_TEST_JDBC_URL", matches = ".+")
-class PostgreSQLQueueTest {
+@Testcontainers
+class PostgreSQLQueueIT {
+    @Container
+    static final PostgreSQLContainer postgres = new PostgreSQLContainer("postgres:17.6")
+        .withDatabaseName("queue_test").withUsername("postgres").withPassword("integration-only");
+
     private static RepairExecutionRepository execution(JdbcTemplate jdbc, TransactionTemplate transactions) {
         ClusterRepository clusters = mock(ClusterRepository.class);
         RepairPolicyRepository policies = mock(RepairPolicyRepository.class);
@@ -62,9 +68,9 @@ class PostgreSQLQueueTest {
 
     @Test
     void twoIndependentWorkersClaimOnceAndRecoverUndispatchedWork() throws Exception {
-        String url = System.getenv("DBAAS_QUEUE_TEST_JDBC_URL");
-        String user = System.getenv().getOrDefault("DBAAS_QUEUE_TEST_USER", "postgres");
-        String password = System.getenv().getOrDefault("DBAAS_QUEUE_TEST_PASSWORD", "queue-demo-only");
+        String url = postgres.getJdbcUrl();
+        String user = postgres.getUsername();
+        String password = postgres.getPassword();
         var aDataSource = new DriverManagerDataSource(url, user, password);
         var bDataSource = new DriverManagerDataSource(url, user, password);
         Flyway.configure().dataSource(aDataSource).load().migrate();

@@ -10,7 +10,8 @@ import org.hibernate.type.SqlTypes;
 import java.time.Instant;
 
 @Entity
-@Table(name = "keyspaces")
+@Table(name = "keyspaces", indexes = @Index(name = "keyspaces_active_provisioning",
+    columnList = "cluster_id,state,owner_id,expires_at"))
 @Getter
 @NoArgsConstructor(access = lombok.AccessLevel.PROTECTED)
 public class KeyspaceEntity {

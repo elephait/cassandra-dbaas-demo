@@ -12,7 +12,7 @@ class FlywayMigrationTest {
     void createsKeyspaceIdentityAndIsRepeatable() throws Exception {
         String url = "jdbc:h2:mem:clean-schema;DB_CLOSE_DELAY=-1";
         var flyway = Flyway.configure().dataSource(url, "sa", "").load();
-        assertEquals("1", flyway.migrate().targetSchemaVersion);
+        assertEquals("2", flyway.migrate().targetSchemaVersion);
         assertEquals(0, flyway.migrate().migrationsExecuted);
         try (var connection = DriverManager.getConnection(url, "sa", "");
              var columns = connection.getMetaData().getColumns(null, "PUBLIC", "KEYSPACES", null)) {

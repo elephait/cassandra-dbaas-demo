@@ -22,6 +22,33 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 class SchemaValidatorTest {
+    @Test
+    void cleanupFailurePreservesOriginalProvisioningFailure() {
+        var session = mock(CqlSession.class);
+        var connections = mock(CassandraConnectionManager.class);
+        var clusters = mock(ClusterRepository.class);
+        var provisioning = mock(KeyspaceRepository.class);
+        when(clusters.requireEnabled("default")).thenReturn(cluster());
+        when(connections.requireSession(any(ClusterRecord.class))).thenReturn(session);
+        when(provisioning.begin(eq("default"), eq("team"), anyInt(), anyInt(), anyLong()))
+            .thenReturn(new ProvisionDecision(false, "owner"));
+        when(provisioning.owns("default", "team", "owner")).thenReturn(true);
+        when(session.execute(any(SimpleStatement.class))).thenReturn(mock(ResultSet.class));
+        var failure = new IllegalStateException("DDL failed");
+        var cleanup = new IllegalStateException("SQL unavailable during cleanup");
+        when(session.execute(anyString())).thenThrow(failure);
+        doThrow(cleanup).when(provisioning).release("default", "team", "owner");
+        var service = new KeyspaceService(connections, clusters, provisioning);
+        try {
+            assertSame(failure, assertThrows(IllegalStateException.class,
+                () -> service.provision("default", "team")));
+            assertArrayEquals(new Throwable[]{cleanup}, failure.getSuppressed());
+            verify(provisioning, never()).complete(anyString(), anyString(), anyString());
+        } finally {
+            service.close();
+        }
+    }
+
     private static ClusterRecord cluster() {
         return new ClusterRecord("default", List.of(new ContactPoint("127.0.0.1", 9042)),
             "dc1", 3, 3, List.of(), 10, 60, 100, 60, true, 1);

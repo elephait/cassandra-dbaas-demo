@@ -11,6 +11,7 @@ import demo.platform.keyspace.KeyspaceRecord.ProvisionDecision;
 import demo.platform.keyspace.persistence.KeyspaceRepository;
 import jakarta.annotation.PreDestroy;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.web.server.ResponseStatusException;
@@ -26,6 +27,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 @Service
 @RequiredArgsConstructor
+@Slf4j
 public class KeyspaceService {
     private final CassandraConnectionManager connections;
     private final ClusterRepository clusters;
@@ -33,13 +35,15 @@ public class KeyspaceService {
     private final ScheduledExecutorService leaseWorker = Executors.newScheduledThreadPool(2);
 
     public Map<String, Object> provision(String clusterId, String keyspace) {
-        ClusterRecord cluster = clusters.requireEnabled(clusterId);
+        // Reject an unusable identifier before touching the registry or the Cassandra session.
         KeyspaceNames.validate(keyspace);
+        ClusterRecord cluster = clusters.requireEnabled(clusterId);
         CqlSession session = connections.requireSession(cluster);
         ProvisionDecision decision = provisioning.begin(clusterId, keyspace,
             cluster.maxKeyspaces(), cluster.provisioningLeaseSeconds(), cluster.configVersion());
         if (decision.alreadyReady()) {
             SchemaValidator.validate(session, keyspace, cluster.datacenter(), cluster.replicationFactor());
+            log.debug("Revalidated ready keyspace cluster={} keyspace={}", clusterId, keyspace);
         } else {
             provisionOwned(cluster, keyspace, decision.owner(), session);
         }
@@ -53,11 +57,11 @@ public class KeyspaceService {
     }
 
     public Map<String, Object> probe(String clusterId, String keyspace, String value) {
-        ClusterRecord cluster = clusters.requireEnabled(clusterId);
         KeyspaceNames.validate(keyspace);
         if (value == null || value.length() > 1024)
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
                 "Value must contain at most 1024 characters");
+        ClusterRecord cluster = clusters.requireEnabled(clusterId);
         CqlSession session = connections.requireSession(cluster);
         UUID row = UUID.randomUUID();
         session.execute(SimpleStatement.newInstance(
@@ -78,7 +82,8 @@ public class KeyspaceService {
         int heartbeatSeconds = Math.max(1, cluster.provisioningLeaseSeconds() / 3);
         ScheduledFuture<?> heartbeat = null;
         try {
-            heartbeat = leaseWorker.scheduleAtFixedRate(() -> renewLease(cluster, keyspace, owner, lost),
+            log.debug("Provisioning started cluster={} keyspace={} owner={}", cluster.id(), keyspace, owner);
+            heartbeat = leaseWorker.scheduleWithFixedDelay(() -> renewLease(cluster, keyspace, owner, lost),
                 heartbeatSeconds, heartbeatSeconds, TimeUnit.SECONDS);
             SchemaValidator.validateKeyspace(session, keyspace, cluster.datacenter(),
                 cluster.replicationFactor(), true);
@@ -92,8 +97,16 @@ public class KeyspaceService {
             SchemaValidator.validate(session, keyspace, cluster.datacenter(), cluster.replicationFactor());
             if (lost.get()) throw new ControlPlaneExceptions.Conflict("Provisioning ownership was lost");
             provisioning.complete(cluster.id(), keyspace, owner);
+            log.info("Provisioning completed cluster={} keyspace={} owner={}", cluster.id(), keyspace, owner);
         } catch (RuntimeException exception) {
-            provisioning.release(cluster.id(), keyspace, owner);
+            try {
+                provisioning.release(cluster.id(), keyspace, owner);
+            } catch (RuntimeException cleanupFailure) {
+                exception.addSuppressed(cleanupFailure);
+                log.warn("Cannot release provisioning lease; expiry will recover it cluster={} keyspace={} owner={}",
+                    cluster.id(), keyspace, owner, cleanupFailure);
+            }
+            log.warn("Provisioning failed cluster={} keyspace={} owner={}", cluster.id(), keyspace, owner, exception);
             throw exception;
         } finally {
             if (heartbeat != null) heartbeat.cancel(false);
@@ -106,11 +119,16 @@ public class KeyspaceService {
     }
 
     private void renewLease(ClusterRecord cluster, String keyspace, String owner, AtomicBoolean lost) {
+        if (lost.get()) return;
         try {
             if (!provisioning.renew(cluster.id(), keyspace, owner,
-                cluster.provisioningLeaseSeconds())) lost.set(true);
+                cluster.provisioningLeaseSeconds()) && lost.compareAndSet(false, true))
+                log.warn("Provisioning lease lost; stopping DDL cluster={} keyspace={} owner={}",
+                    cluster.id(), keyspace, owner);
         } catch (RuntimeException exception) {
-            lost.set(true);
+            if (lost.compareAndSet(false, true))
+                log.warn("Cannot confirm provisioning lease; stopping DDL cluster={} keyspace={} owner={}",
+                    cluster.id(), keyspace, owner, exception);
         }
     }
 

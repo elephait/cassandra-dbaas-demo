@@ -19,6 +19,10 @@ import java.util.UUID;
 @Repository
 @RequiredArgsConstructor
 public class RepairExecutionRepository {
+    // operations.detail is VARCHAR(4000); every write is bounded before it reaches the database so a
+    // long diagnostic string cannot roll back a terminal transition and strand the lease.
+    private static final int MAX_DETAIL_LENGTH = 3900;
+
     private final JdbcTemplate jdbc;
     private final TransactionTemplate transactions;
     private final ClusterRepository clusters;
@@ -54,9 +58,13 @@ public class RepairExecutionRepository {
         if (queued.isEmpty()) return null;
         OperationRecord operation = queued.getFirst();
         var cluster = clusters.get(operation.clusterId());
-        if (cluster == null || !cluster.enabled()) return null;
+        if (cluster == null || !cluster.enabled()) return failUnclaimable(operation, "Cluster is disabled or unregistered");
         RepairPolicy policy = repairPolicies.get(operation.clusterId());
-        if (policy == null || policy.version() != operation.repairPolicyVersion()) return null;
+        if (policy == null) return failUnclaimable(operation, "Repair policy is missing for this cluster");
+        if (policy.version() != operation.repairPolicyVersion())
+            return failUnclaimable(operation, "Repair policy version " + policy.version()
+                + " replaced the accepted version " + operation.repairPolicyVersion()
+                + "; submit a new repair request");
         int leaseSeconds = requestedLeaseSeconds == null
             ? Math.toIntExact(policy.leaseMinutes() * 60L) : requestedLeaseSeconds;
         String owner = UUID.randomUUID().toString();
@@ -69,6 +77,20 @@ public class RepairExecutionRepository {
             owner, operation.id().toString());
         if (claimed != 1) throw new ControlPlaneExceptions.Conflict("Repair claim was lost");
         return queue.get(operation.id());
+    }
+
+    // Queued work that can no longer be admitted must become visible instead of occupying a slot
+    // silently forever. Nothing was dispatched, so the attempt is released and reported as FAILED.
+    private OperationRecord failUnclaimable(OperationRecord operation, String reason) {
+        jdbc.update("UPDATE operations SET state = 'FAILED', owner_id = NULL, detail = ?, "
+                + "updated_at = CURRENT_TIMESTAMP WHERE operation_id = ? AND state = 'QUEUED'",
+            truncate(reason), operation.id().toString());
+        return null;
+    }
+
+    private static String truncate(String detail) {
+        return detail == null || detail.length() <= MAX_DETAIL_LENGTH
+            ? detail : detail.substring(0, MAX_DETAIL_LENGTH);
     }
 
     public boolean renew(String owner, int seconds) {
@@ -104,7 +126,7 @@ public class RepairExecutionRepository {
                     + "detail = ?, next_attempt_at = ?, retry_count = retry_count + 1, updated_at = CURRENT_TIMESTAMP WHERE operation_id = ? AND owner_id = ? "
                     + "AND state = 'CLAIMED' AND EXISTS (SELECT 1 FROM repair_locks "
                     + "WHERE cluster_id = ? AND owner_id = ?)",
-                reason.substring(0, Math.min(reason.length(), 3500)), Timestamp.from(databaseTime().plusSeconds(delay)),
+                truncate(reason), Timestamp.from(databaseTime().plusSeconds(delay)),
                 operation.id().toString(), operation.owner(), operation.clusterId(), operation.owner());
             if (changed == 1) release(operation.clusterId(), operation.owner());
             return changed == 1;
@@ -178,7 +200,7 @@ public class RepairExecutionRepository {
                 + "WHERE operation_id = ? AND cluster_id = ? AND owner_id = ? "
                 + "AND state IN ('CLAIMED','RUNNING') AND EXISTS (SELECT 1 FROM repair_locks "
                 + "WHERE cluster_id = ? AND owner_id = ?)",
-            operation.detail(), Timestamp.from(operation.updated()), operation.id().toString(),
+            truncate(operation.detail()), Timestamp.from(operation.updated()), operation.id().toString(),
             operation.clusterId(), operation.owner(), operation.clusterId(), operation.owner());
         if (changed != 1) throw new ControlPlaneExceptions.Conflict("Repair ownership/state lost");
     }
@@ -192,7 +214,7 @@ public class RepairExecutionRepository {
             int changed = jdbc.update("UPDATE operations SET state = ?, detail = ?, updated_at = ? "
                     + "WHERE operation_id = ? AND cluster_id = ? AND owner_id = ? "
                     + "AND state IN ('CLAIMED','RUNNING')",
-                operation.state().name(), operation.detail(), Timestamp.from(operation.updated()),
+                operation.state().name(), truncate(operation.detail()), Timestamp.from(operation.updated()),
                 operation.id().toString(), operation.clusterId(), operation.owner());
             if (changed != 1) throw new ControlPlaneExceptions.Conflict("Repair is no longer active");
             release(operation.clusterId(), operation.owner());
