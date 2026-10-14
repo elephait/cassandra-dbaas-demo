@@ -1,68 +1,131 @@
 package demo.platform;
 
+import demo.platform.cluster.persistence.ClusterRepository;
+import demo.platform.misc.ApiExceptionHandler;
+import demo.platform.misc.ControlPlaneExceptions;
+import demo.platform.repair.OperationRecord;
+import demo.platform.repair.OperationRecord.RepairPolicy;
+import demo.platform.repair.RepairCommandRunner;
+import demo.platform.repair.RepairWorker;
+import demo.platform.repair.RepairState;
+import demo.platform.repair.persistence.RepairExecutionRepository;
+import demo.platform.repair.persistence.RepairPolicyRepository;
+import demo.platform.repair.persistence.RepairQueueRepository;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.jdbc.test.autoconfigure.JdbcTest;
-import org.springframework.test.context.ContextConfiguration;
+import org.springframework.boot.data.jpa.test.autoconfigure.DataJpaTest;
+import org.springframework.context.annotation.Import;
+import org.springframework.jdbc.core.JdbcTemplate;
+
 import java.nio.file.Path;
 import java.time.Instant;
+import java.util.UUID;
+
 import static org.junit.jupiter.api.Assertions.*;
 
-@JdbcTest
-@ContextConfiguration(classes = ControlPlaneRepository.class)
+@DataJpaTest
+@Import({ClusterRepository.class,     RepairQueueRepository.class, RepairExecutionRepository.class})
 class RepairSafetyTest {
-    @Autowired ControlPlaneRepository repository;
+    @Test
+    void completesEveryNodeWithoutTreatingSecondDispatchAsAConflict() {
+        policies.save(new RepairPolicy("default",
+            java.util.List.of("node1", "node2", "node3"), "noop {node} {keyspace}", 1, 0));
+        java.util.List<String> commands = new java.util.ArrayList<>();
+        var runner = new RepairCommandRunner() {
+            @Override
+            public void execute(String command, Path output) {
+                commands.add(command);
+            }
+        };
+        var properties = new ApiExceptionHandler.CassandraProperties();
+        properties.getRepair().setWorkerThreads(1);
+        var service = new RepairWorker(properties, clusters, execution, policies, null, runner);
+        queue.accept("default", "sequence", UUID.randomUUID().toString());
+        var operation = execution.claim(60);
+        try {
+            service.run(operation);
+            assertEquals(java.util.List.of("noop node1 sequence", "noop node2 sequence", "noop node3 sequence"), commands);
+            assertEquals(RepairState.SUCCEEDED, queue.get(operation.id()).state());
+            assertNull(jdbc.queryForObject("SELECT owner_id FROM repair_locks WHERE cluster_id = 'default'", String.class));
+        } finally {
+            service.close();
+        }
+    }
 
-    @Test void timeoutRetainsOwnershipUntilAcknowledgement() {
-        var properties = new CassandraProperties();
-        properties.getRepair().setNodes("node1");
-        properties.getRepair().setCommand("fake {node} {keyspace}");
-        var service = new RepairService(properties, repository, null) {
-            @Override void executeCommand(String command, Path log) throws Exception {
+    @Autowired
+    ClusterRepository clusters;
+    @Autowired
+    RepairQueueRepository queue;
+    @Autowired
+    RepairExecutionRepository execution;
+    @Autowired
+    RepairPolicyRepository policies;
+    @Autowired
+    JdbcTemplate jdbc;
+
+    private static OperationRecord terminal(OperationRecord operation, String detail) {
+        return new OperationRecord(operation.id(), operation.clusterId(), operation.keyspace(), operation.owner(),
+            RepairState.SUCCEEDED, detail, operation.repairPolicyVersion(), Instant.now());
+    }
+
+    @Test
+    void timeoutRetainsOwnershipUntilAcknowledgement() {
+        var service = serviceThatTimesOut();
+        var operation = claimedRepair("team", Instant.now().plusSeconds(60));
+        try {
+            service.run(operation);
+            assertEquals(RepairState.UNKNOWN, queue.get(operation.id()).state());
+            assertThrows(ControlPlaneExceptions.Conflict.class,
+                () -> claimedRepair("other", Instant.now().plusSeconds(60)));
+            execution.acknowledge(operation.id());
+            assertNotNull(claimedRepair("other", Instant.now().plusSeconds(60)));
+        } finally {
+            service.close();
+        }
+    }
+
+    @Test
+    void confirmedCompletionReleasesOwnershipInSameTransaction() {
+        var operation = claimedRepair("team", Instant.now().plusSeconds(60));
+        execution.finish(terminal(operation, "done"));
+        assertEquals(RepairState.SUCCEEDED, queue.get(operation.id()).state());
+        var next = claimedRepair("other", Instant.now().plusSeconds(60));
+        assertThrows(ControlPlaneExceptions.Conflict.class,
+            () -> execution.finish(terminal(operation, "stale completion")));
+        assertEquals(RepairState.RUNNING, queue.get(next.id()).state());
+    }
+
+    @Test
+    void failedTerminalWriteDoesNotReleaseOwnership() {
+        var operation = claimedRepair("team", Instant.now().plusSeconds(60));
+        assertThrows(org.springframework.dao.DataIntegrityViolationException.class,
+            () -> execution.finish(terminal(operation, "x".repeat(5000))));
+        assertEquals(RepairState.RUNNING, queue.get(operation.id()).state());
+        assertThrows(ControlPlaneExceptions.Conflict.class,
+            () -> claimedRepair("other", Instant.now().plusSeconds(60)));
+    }
+
+    private RepairWorker serviceThatTimesOut() {
+        var properties = new ApiExceptionHandler.CassandraProperties();
+        properties.getRepair().setWorkerThreads(1);
+        var runner = new RepairCommandRunner() {
+            @Override
+            public void execute(String command, Path log) throws Exception {
                 throw new java.util.concurrent.TimeoutException("simulated lost CLI response");
             }
         };
-        var op = claimedRepair("tenant_team", Instant.now().plusSeconds(60));
-        try {
-            service.run(op);
-            assertEquals("UNKNOWN", repository.getOperation(op.id()).state());
-            assertThrows(ControlPlaneRepository.ControlPlaneConflictException.class,
-                    () -> claimedRepair("tenant_other", Instant.now().plusSeconds(60)));
-            repository.acknowledgeUnknownRepair(op.id());
-            assertNotNull(claimedRepair("tenant_other", Instant.now().plusSeconds(60)));
-        } finally { service.close(); }
+        return new RepairWorker(properties, clusters, execution, policies, null, runner);
     }
 
-    @Test void confirmedCompletionReleasesOwnershipInSameTransaction() {
-        var op = claimedRepair("tenant_team", Instant.now().plusSeconds(60));
-        repository.finishRepair(new ControlPlaneRepository.OperationRecord(op.id(), op.keyspace(), op.owner(),
-                "SUCCEEDED", "done", Instant.now()));
-        assertEquals("SUCCEEDED", repository.getOperation(op.id()).state());
-        var next = claimedRepair("tenant_other", Instant.now().plusSeconds(60));
-        assertThrows(ControlPlaneRepository.ControlPlaneConflictException.class,
-                () -> repository.finishRepair(new ControlPlaneRepository.OperationRecord(op.id(), op.keyspace(), op.owner(),
-                        "SUCCEEDED", "stale completion", Instant.now())));
-        assertEquals("RUNNING", repository.getOperation(next.id()).state());
+    private OperationRecord claimedRepair(String keyspace, Instant expiry) {
+        Integer occupied = jdbc.queryForObject("SELECT COUNT(*) FROM repair_locks "
+            + "WHERE cluster_id = 'default' AND owner_id IS NOT NULL", Integer.class);
+        if (occupied != null && occupied > 0) throw new ControlPlaneExceptions.Conflict("Repair already running");
+        queue.accept("default", keyspace, UUID.randomUUID().toString());
+        var operation = execution.claim(60);
+        execution.markDispatched(operation);
+        jdbc.update("UPDATE repair_locks SET expires_at = ? WHERE owner_id = ?",
+            java.sql.Timestamp.from(expiry), operation.owner());
+        return queue.get(operation.id());
     }
-
-    @Test void failedTerminalWriteDoesNotReleaseOwnership() {
-        var op = claimedRepair("tenant_team", Instant.now().plusSeconds(60));
-        assertThrows(org.springframework.dao.DataIntegrityViolationException.class,
-                () -> repository.finishRepair(new ControlPlaneRepository.OperationRecord(op.id(), op.keyspace(), op.owner(),
-                        "SUCCEEDED", "x".repeat(5000), Instant.now())));
-        assertEquals("RUNNING", repository.getOperation(op.id()).state());
-        assertThrows(ControlPlaneRepository.ControlPlaneConflictException.class,
-                () -> claimedRepair("tenant_other", Instant.now().plusSeconds(60)));
-    }
-    @Autowired org.springframework.jdbc.core.JdbcTemplate queueJdbc;
-    private ControlPlaneRepository.OperationRecord claimedRepair(String keyspace, Instant expiry) {
-        Integer occupied = queueJdbc.queryForObject("SELECT COUNT(*) FROM repair_lock WHERE owner_id IS NOT NULL", Integer.class);
-        if (occupied != null && occupied > 0) throw new ControlPlaneRepository.ControlPlaneConflictException("Repair already running");
-        repository.acceptRepair(keyspace, expiry, java.util.UUID.randomUUID().toString());
-        var op = repository.claimRepair(60);
-        repository.markDispatched(op);
-        queueJdbc.update("UPDATE repair_lock SET expires_at = ? WHERE owner_id = ?", java.sql.Timestamp.from(expiry), op.owner());
-        return repository.getOperation(op.id());
-    }}
-
-
+}

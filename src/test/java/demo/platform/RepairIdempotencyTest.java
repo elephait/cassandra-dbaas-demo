@@ -1,51 +1,79 @@
 package demo.platform;
 
+import demo.platform.cluster.persistence.ClusterRepository;
+import demo.platform.misc.ControlPlaneExceptions;
+import demo.platform.repair.OperationRecord;
+import demo.platform.repair.OperationRecord.RepairDecision;
+import demo.platform.repair.RepairState;
+import demo.platform.repair.persistence.RepairExecutionRepository;
+import demo.platform.repair.persistence.RepairPolicyRepository;
+import demo.platform.repair.persistence.RepairQueueRepository;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.jdbc.test.autoconfigure.JdbcTest;
-import org.springframework.test.context.ContextConfiguration;
+import org.springframework.boot.data.jpa.test.autoconfigure.DataJpaTest;
+import org.springframework.context.annotation.Import;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
+
 import java.time.Instant;
-import java.util.concurrent.*;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+
 import static org.junit.jupiter.api.Assertions.*;
 
-@JdbcTest
-@ContextConfiguration(classes = ControlPlaneRepository.class)
+@DataJpaTest
+@Import({ClusterRepository.class,     RepairQueueRepository.class, RepairExecutionRepository.class})
 class RepairIdempotencyTest {
-    @Autowired ControlPlaneRepository repository;
+    @Autowired
+    RepairQueueRepository queue;
+    @Autowired
+    RepairExecutionRepository execution;
 
-    @Test void replaysActiveAndCompletedRequestsAndRejectsConflictingReuse() {
-        var first = repository.acceptRepair("tenant_team", Instant.now().plusSeconds(60), "repair-test");
-        var repeated = repository.acceptRepair("tenant_team", Instant.now().plusSeconds(60), "repair-test");
-        assertTrue(first.created()); assertFalse(repeated.created());
-        assertEquals(first.operation().id(), repeated.operation().id());
-        assertThrows(ControlPlaneRepository.ControlPlaneConflictException.class,
-                () -> repository.acceptRepair("tenant_other", Instant.now().plusSeconds(60), "repair-test"));
-        var op = repository.claimRepair(60);
-        repository.finishRepair(new ControlPlaneRepository.OperationRecord(op.id(), op.keyspace(), op.owner(), "SUCCEEDED", "done", Instant.now()));
-        var after = repository.acceptRepair("tenant_team", Instant.now().plusSeconds(60), "repair-test");
-        assertFalse(after.created()); assertEquals("SUCCEEDED", after.operation().state());
-        assertEquals(op.id(), after.operation().id());
-        assertTrue(repository.acceptRepair("tenant_team", Instant.now().plusSeconds(60), "intentional-next-repair").created());
+    private static OperationRecord terminal(OperationRecord operation) {
+        return new OperationRecord(operation.id(), operation.clusterId(), operation.keyspace(), operation.owner(),
+            RepairState.SUCCEEDED, "done", Instant.now());
     }
 
-    @Test @Transactional(propagation = Propagation.NOT_SUPPORTED)
+    @Test
+    void replaysActiveAndCompletedRequestsAndRejectsConflictingReuse() {
+        var first = queue.accept("default", "team", "repair-test");
+        var repeated = queue.accept("default", "team", "repair-test");
+        assertTrue(first.created());
+        assertFalse(repeated.created());
+        assertEquals(first.operation().id(), repeated.operation().id());
+        assertThrows(ControlPlaneExceptions.Conflict.class,
+            () -> queue.accept("default", "other", "repair-test"));
+        var operation = execution.claim(60);
+        execution.finish(terminal(operation));
+        var after = queue.accept("default", "team", "repair-test");
+        assertFalse(after.created());
+        assertEquals(RepairState.SUCCEEDED, after.operation().state());
+        assertEquals(operation.id(), after.operation().id());
+        assertTrue(queue.accept("default", "team", "intentional-next-repair").created());
+    }
+
+    @Test
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
     void concurrentSubmissionsHaveExactlyOneCreator() throws Exception {
         var pool = Executors.newFixedThreadPool(2);
         var gate = new CountDownLatch(1);
-        Callable<ControlPlaneRepository.RepairDecision> accept = () -> {
+        Callable<RepairDecision> accept = () -> {
             assertTrue(gate.await(5, TimeUnit.SECONDS));
-            return repository.acceptRepair("tenant_race", Instant.now().plusSeconds(60), "concurrent-request");
+            return queue.accept("default", "race", "concurrent-request");
         };
         try {
-            var a = pool.submit(accept); var b = pool.submit(accept); gate.countDown();
-            var first = a.get(10, TimeUnit.SECONDS); var second = b.get(10, TimeUnit.SECONDS);
+            var a = pool.submit(accept);
+            var b = pool.submit(accept);
+            gate.countDown();
+            var first = a.get(10, TimeUnit.SECONDS);
+            var second = b.get(10, TimeUnit.SECONDS);
             assertEquals(first.operation().id(), second.operation().id());
             assertNotEquals(first.created(), second.created());
-            var op = repository.claimRepair(60);
-            repository.finishRepair(new ControlPlaneRepository.OperationRecord(op.id(), op.keyspace(), op.owner(), "SUCCEEDED", "done", Instant.now()));
-        } finally { pool.shutdownNow(); }
+            execution.finish(terminal(execution.claim(60)));
+        } finally {
+            pool.shutdownNow();
+        }
     }
 }
-

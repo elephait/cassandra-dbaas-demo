@@ -1,6 +1,6 @@
 spring:
   datasource:
-    url: jdbc:h2:file:./.local/control-plane;DB_CLOSE_ON_EXIT=FALSE
+    url: jdbc:h2:file:${DBAAS_LOCAL_DB_PATH:./.local/control-plane-keyspaces};DB_CLOSE_ON_EXIT=FALSE;WRITE_DELAY=0
     username: sa
     password:
     driver-class-name: org.h2.Driver

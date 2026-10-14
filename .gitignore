@@ -1,6 +1,7 @@
 .m2/
 target/
 .local/
+.smoke/
 
 .idea/
 *.iml

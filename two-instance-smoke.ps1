@@ -12,16 +12,16 @@ try {
         $deadline=(Get-Date).AddSeconds(90)
         do {
             Start-Sleep -Seconds 2
-            try { $health=Invoke-RestMethod "http://localhost:$port/cluster/health" -TimeoutSec 3 } catch { $health=$null }
+            try { $health=Invoke-RestMethod "http://localhost:$port/clusters/default/health" -TimeoutSec 3 } catch { $health=$null }
         } while ((!$health -or $health.up -ne 3) -and (Get-Date) -lt $deadline)
         if (!$health -or $health.up -ne 3) { throw "Instance $port did not connect to cluster; inspect $smokeLogs" }
         Write-Output "Instance $port connected to three replicas"
     }
     $headers=@{'X-Admin-Token'='local-demo-only';'Idempotency-Key'=[guid]::NewGuid().ToString()}
-    Invoke-RestMethod http://localhost:18088/tenants/queue_smoke/keyspace -Method Post -Headers $headers | Out-Null
-    $body='{"tenant":"queue_smoke","approved":true}'
-    $first=Invoke-RestMethod http://localhost:18088/cluster/repair -Method Post -Headers $headers -ContentType application/json -Body $body
-    $replay=Invoke-RestMethod http://localhost:18089/cluster/repair -Method Post -Headers $headers -ContentType application/json -Body $body
+    Invoke-RestMethod http://localhost:18088/clusters/default/keyspaces/queue_smoke -Method Post -Headers $headers | Out-Null
+    $body='{"keyspace":"queue_smoke","approved":true}'
+    $first=Invoke-RestMethod http://localhost:18088/clusters/default/repair -Method Post -Headers $headers -ContentType application/json -Body $body
+    $replay=Invoke-RestMethod http://localhost:18089/clusters/default/repair -Method Post -Headers $headers -ContentType application/json -Body $body
     if ($first.id -ne $replay.id) { throw 'Two instances returned different operations for the same request' }
     Write-Output "Cross-instance idempotency passed: $($first.id)"
     $deadline=(Get-Date).AddMinutes(3)
