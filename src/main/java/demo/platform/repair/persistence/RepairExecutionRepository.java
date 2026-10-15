@@ -134,7 +134,9 @@ public class RepairExecutionRepository {
 
     public int reconcileExpired() {
         List<String> clusterIds = jdbc.query("SELECT cluster_id FROM repair_locks WHERE owner_id IS NOT NULL "
-            + "AND expires_at <= CURRENT_TIMESTAMP", (rs, row) -> rs.getString(1));
+            + "AND expires_at <= CURRENT_TIMESTAMP AND NOT EXISTS (SELECT 1 FROM operations o "
+            + "WHERE o.cluster_id = repair_locks.cluster_id AND o.owner_id = repair_locks.owner_id "
+            + "AND o.repair_transport = 'jmx' AND o.state = 'RUNNING')", (rs, row) -> rs.getString(1));
         return clusterIds.stream().mapToInt(this::reconcileExpired).sum();
     }
 

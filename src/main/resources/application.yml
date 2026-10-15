@@ -39,6 +39,7 @@ demo:
     enabled: ${DBAAS_ADDRESS_TRANSLATION_ENABLED:true}
     mappings: ${DBAAS_ADDRESS_TRANSLATION_MAPPINGS:172.28.91.11=127.0.0.1:9042,172.28.91.12=127.0.0.1:9043,172.28.91.13=127.0.0.1:9044}
   repair:
+    transport: ${DBAAS_REPAIR_TRANSPORT:jmx}
     nodes: ${DBAAS_REPAIR_NODES:cassandra1,cassandra2,cassandra3}
     command: ${DBAAS_REPAIR_COMMAND:docker compose exec -T {node} nodetool repair -pr {keyspace}}
     lease-minutes: ${DBAAS_REPAIR_LEASE_MINUTES:60}

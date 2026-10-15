@@ -21,6 +21,9 @@ public class RepairCoordinator {
     private final ClusterRegistryService clusters;
     private final RepairQueueService queue;
     private final RepairExecutionRepository execution;
+    private final demo.platform.repair.jmx.JmxRepairProperties jmx;
+    private final RepairConfigurationService repairPolicies;
+    private final org.springframework.core.env.Environment environment;
 
     private static RepairOperation toView(OperationRecord operation) {
         return new RepairOperation(operation.id(), operation.clusterId(), operation.keyspace(),
@@ -51,6 +54,16 @@ public class RepairCoordinator {
         if (up != cluster.expectedNodes())
             throw new ResponseStatusException(HttpStatus.CONFLICT,
                 "All expected nodes must be UP before repair");
+        if ("jmx".equals(environment.getProperty("demo.repair.transport", "jmx"))) {
+            var policy = repairPolicies.getPolicy(clusterId);
+            if (policy == null) throw new IllegalArgumentException("Missing repair policy");
+            var expectedIds = policy.nodes().stream().map(n -> jmx.require(clusterId, n).getHostId()).toList();
+            var actualIds = session.getMetadata().getNodes().values().stream()
+                .filter(n -> cluster.datacenter().equals(n.getDatacenter()))
+                .map(n -> n.getHostId().toString()).collect(java.util.stream.Collectors.toSet());
+            if (expectedIds.size() != actualIds.size() || !new java.util.HashSet<>(expectedIds).equals(actualIds))
+                throw new IllegalArgumentException("JMX targets must cover exactly the configured datacenter's nodes");
+        }
         return toView(queue.accept(clusterId, keyspace, requestKey, cluster.configVersion()).operation());
     }
 

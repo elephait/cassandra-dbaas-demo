@@ -23,6 +23,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 @Service
 @Slf4j
+@org.springframework.boot.autoconfigure.condition.ConditionalOnProperty(name = "demo.repair.transport", havingValue = "cli")
 public class RepairWorker {
     private final ExecutorService workers;
     private final ScheduledExecutorService poller;

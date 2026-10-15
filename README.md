@@ -57,7 +57,8 @@ The connector polls only cluster IDs, enablement and versions, loading connectio
 - **Backpressure:** bounded worker/connection pools, a cap of 1,000 queued repairs per cluster and persisted retry
   backoff contain outages.
 - **Worker placement:** ideally, deploy repair workers as independent, autoscaled instances sharing the durable queue,
-  so maintenance capacity can scale separately from API traffic. API instances can set `DBAAS_REPAIR_WORKER_ENABLED=false`;
+  so maintenance capacity can scale separately from API traffic. API instances can set
+  `DBAAS_REPAIR_WORKER_ENABLED=false`;
   worker instances keep execution enabled. Per-cluster exclusion still applies regardless of worker count.
 
 ### Repair state machine
@@ -78,15 +79,15 @@ stateDiagram-v2
     ACKNOWLEDGED --> [*]
 ```
 
-| State | Meaning and next action |
-|---|---|
-| QUEUED | Durable request waiting for a worker. |
-| CLAIMED | A worker owns the lease; remote dispatch has not been recorded. Safe undispatched work can be requeued. |
-| RUNNING | Dispatch may have begun; the worker renews ownership while executing the configured node repairs. |
-| SUCCEEDED | All configured repair commands completed successfully; cluster exclusion is released. |
-| FAILED | A confirmed rejection/failure, such as an invalid queued policy; no uncertain remote work is automatically retried. |
-| UNKNOWN | The remote outcome is uncertain. Cluster exclusion remains, even after lease expiry; operator reconciliation is required. |
-| ACKNOWLEDGED | The operator verified remote activity and released exclusion; this does not assert repair success. |
+| State        | Meaning and next action                                                                                                   |
+|--------------|---------------------------------------------------------------------------------------------------------------------------|
+| QUEUED       | Durable request waiting for a worker.                                                                                     |
+| CLAIMED      | A worker owns the lease; remote dispatch has not been recorded. Safe undispatched work can be requeued.                   |
+| RUNNING      | Dispatch may have begun; the worker renews ownership while executing the configured node repairs.                         |
+| SUCCEEDED    | All configured repair commands completed successfully; cluster exclusion is released.                                     |
+| FAILED       | A confirmed rejection/failure, such as an invalid queued policy; no uncertain remote work is automatically retried.       |
+| UNKNOWN      | The remote outcome is uncertain. Cluster exclusion remains, even after lease expiry; operator reconciliation is required. |
+| ACKNOWLEDGED | The operator verified remote activity and released exclusion; this does not assert repair success.                        |
 
 A command failure or timeout after possible dispatch becomes UNKNOWN, not FAILED. Acknowledgement uses
 `POST /operations/{id}/acknowledge` with `{"cassandraActivityVerified":true}` after the old worker is stopped/fenced and
@@ -160,17 +161,6 @@ The script stops one node, proves quorum reads/writes, restarts it, requests rep
 Its status interval defaults to 20 seconds and can be set with `-PollIntervalSeconds` or `DBAAS_POLL_INTERVAL_SECONDS`.
 **The script restores the node; the application observes recovery and coordinates the requested repair.**
 
-Application SQL, parameters and transaction boundaries are written to `.local/sql-trace.log`; routine polling
-SQL is included so background database activity can be inspected. Maven tests use `.local/test-sql-trace.log` and capture
-detailed console output under `target/surefire-reports` or `target/failsafe-reports`.
-
-```powershell
-mvn clean verify
-mvn -Pintegration verify
-```
-
-The integration profile starts isolated Cassandra and PostgreSQL containers to check multi-instance coordination.
-
 ## Scope and next steps
 
 This POC manages coordination, not infrastructure: no machine provisioning, node lifecycle management, backup/restore
@@ -182,10 +172,13 @@ visibility,
 reconciliation, operation retention/metrics and production access control.
 
 Horizontal scaling increases capacity across independent clusters, but every replica currently connects to every
-enabled cluster. Larger deployments may require assigning clusters to specific replicas to limit connection and memory costs.
-Splitting API and worker tiers (`DBAAS_REPAIR_WORKER_ENABLED`) raises repair throughput without slowing request handling,
+enabled cluster. Larger deployments may require assigning clusters to specific replicas to limit connection and memory
+costs.
+Splitting API and worker tiers (`DBAAS_REPAIR_WORKER_ENABLED`) raises repair throughput without slowing request
+handling,
 but each worker still connects to every enabled cluster, so session assignment remains the prerequisite for fleet scale.
 
 The local tests verify functional correctness and coordination. Fleet-scale performance should be evaluated separately
-in a representative environment, measuring throughput, latency and resource usage under both peak and sustained workloads.
+in a representative environment, measuring throughput, latency and resource usage under both peak and sustained
+workloads.
 Disk-loss recovery and worker crashes during remote repair require separate failure-injection tests.
