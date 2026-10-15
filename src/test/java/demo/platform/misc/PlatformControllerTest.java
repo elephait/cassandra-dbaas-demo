@@ -99,7 +99,7 @@ class PlatformControllerTest {
         var properties = properties();
         var connections = new CassandraConnectionManager(properties, mock(ClusterConfigurationService.class));
         var clusters = mock(ClusterRegistryService.class);
-        when(clusters.requireEnabled("default")).thenReturn(cluster("default"));
+        when(clusters.requireEnabled("default")).thenReturn(cluster("default").settings());
         var controller = new ClusterController(
             new ClusterService(connections, mock(ClusterConfigurationService.class), clusters),
             new AdminAccess(properties));
@@ -109,7 +109,7 @@ class PlatformControllerTest {
         assertEquals("UNAVAILABLE", health.get("status"));
         assertFalse((boolean) health.get("quorumAvailable"));
         assertThrows(org.springframework.web.server.ResponseStatusException.class,
-            () -> connections.requireSession(cluster("default")));
+            () -> connections.requireSession(cluster("default").settings()));
         connections.close();
     }
 

@@ -7,7 +7,6 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.util.Map;
 
 @Service
 @RequiredArgsConstructor
@@ -24,9 +23,5 @@ public class RepairConfigurationService {
         return policies.get(clusterId);
     }
 
-    @Transactional(readOnly = true)
-    public Map<String, RepairPolicy> listPolicies() {
-        return policies.list();
-    }
 
 }

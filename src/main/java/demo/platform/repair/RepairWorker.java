@@ -31,6 +31,7 @@ public class RepairWorker {
     private final AtomicBoolean closing = new AtomicBoolean();
     private final boolean enabled;
     private final int workerThreads;
+    private final int pollIntervalSeconds;
     private final ClusterRegistryService clusters;
     private final RepairExecutionRepository execution;
     private final RepairClaimService claims;
@@ -50,6 +51,7 @@ public class RepairWorker {
         this.connections = connections;
         this.commandRunner = commandRunner;
         this.workerThreads = properties.getRepair().getWorkerThreads();
+        this.pollIntervalSeconds = properties.getPollIntervalSeconds();
         if (workerThreads < 1 || workerThreads > 64)
             throw new IllegalArgumentException("Repair worker threads must be 1..64");
         this.enabled = properties.getRepair().isWorkerEnabled();
@@ -75,7 +77,7 @@ public class RepairWorker {
             log.info("Repair worker is disabled on this instance; it serves API traffic only");
             return;
         }
-        poller.scheduleWithFixedDelay(this::poll, 0, 2, TimeUnit.SECONDS);
+        poller.scheduleWithFixedDelay(this::poll, 0, pollIntervalSeconds, TimeUnit.SECONDS);
     }
 
     void poll() {
@@ -111,7 +113,7 @@ public class RepairWorker {
         AtomicBoolean lost = new AtomicBoolean();
         ScheduledFuture<?> heartbeat = null;
         try {
-            ClusterRecord cluster = clusters.requireEnabled(operation.clusterId());
+            ClusterRecord.Settings cluster = clusters.requireEnabled(operation.clusterId());
             RepairPolicy policy = requirePolicy(operation);
             int leaseSeconds = Math.toIntExact(policy.leaseMinutes() * 60L);
             int heartbeatSeconds = Math.max(1, leaseSeconds / 3);
@@ -156,7 +158,7 @@ public class RepairWorker {
         }
     }
 
-    private void validateClusterForDispatch(OperationRecord operation, ClusterRecord cluster) {
+    private void validateClusterForDispatch(OperationRecord operation, ClusterRecord.Settings cluster) {
         if (connections == null) return;
         var session = connections.requireSession(cluster);
         long up = session.getMetadata().getNodes().values().stream()

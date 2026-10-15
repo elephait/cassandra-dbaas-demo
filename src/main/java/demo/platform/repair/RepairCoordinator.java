@@ -40,7 +40,7 @@ public class RepairCoordinator {
         KeyspaceNames.validate(keyspace);
         OperationRecord previous = queue.find(clusterId, requestKey, keyspace);
         if (previous != null) return toView(previous);
-        ClusterRecord cluster = clusters.requireEnabled(clusterId);
+        ClusterRecord.Settings cluster = clusters.requireEnabled(clusterId);
         var session = connections.requireSession(cluster);
         if (!session.getMetadata().getKeyspaces().containsKey(
             com.datastax.oss.driver.api.core.CqlIdentifier.fromInternal(keyspace)))

@@ -41,6 +41,10 @@ Cross-domain coordination stays in services; repositories focus on their own per
 persistence. Explicit SQL handles repair claims and ownership transitions where row locks and affected-row checks
 are part of correctness. Remote Cassandra calls run outside database transactions.
 
+Cluster inventory is lightweight: `GET /clusters` returns scalar summaries without loading connection collections or
+repair policies. `GET /clusters/{id}` returns the full configuration and repair policy; both require the admin token.
+The connector polls only cluster IDs, enablement and versions, loading connection settings when a session is needed.
+
 ### Concurrency and recovery
 
 - **Deduplication:** a cluster-scoped idempotency key identifies one repair request. Replaying it returns the original
@@ -107,13 +111,20 @@ $env:SPRING_PROFILES_ACTIVE = 'local'
 ```
 
 The application starts at `http://localhost:8088`. Wait until cluster health reports `HEALTHY`.
-The local cluster has three nodes with replication factor 3.
+The local cluster has three nodes with replication factor 3. Background polling defaults to 20 seconds; set
+`DBAAS_POLL_INTERVAL_SECONDS` before starting the application to change it. Startup checks run immediately, and lease
+heartbeats keep their independent timing. A queued repair may wait up to one polling interval before starting.
 
 In another terminal, run this end-to-end example:
 
 ```powershell
 $base = 'http://localhost:8088'
 $admin = @{'X-Admin-Token' = 'local-demo-only'}
+$pollSeconds = 20
+if ($env:DBAAS_POLL_INTERVAL_SECONDS) { $pollSeconds = [int]$env:DBAAS_POLL_INTERVAL_SECONDS }
+
+Invoke-RestMethod "$base/clusters" -Headers $admin
+Invoke-RestMethod "$base/clusters/default" -Headers $admin
 
 Invoke-RestMethod "$base/clusters/default/health"
 Invoke-RestMethod "$base/clusters/default/keyspaces/interview" -Method Post -Headers $admin
@@ -125,7 +136,7 @@ $body = '{"keyspace":"interview","approved":true}'
 $op = Invoke-RestMethod "$base/clusters/default/repair" `
     -Method Post -Headers $admin -ContentType application/json -Body $body
 do {
-    Start-Sleep -Seconds 2
+    Start-Sleep -Seconds $pollSeconds
     $status = Invoke-RestMethod "$base/operations/$($op.id)" -Headers $admin
     $status | Select-Object id,state,detail
 } while ($status.state -in @('QUEUED','CLAIMED','RUNNING'))
@@ -146,7 +157,19 @@ For a live three-node recovery demonstration, keep the local application running
 ```
 
 The script stops one node, proves quorum reads/writes, restarts it, requests repair and checks reads/writes again.
+Its status interval defaults to 20 seconds and can be set with `-PollIntervalSeconds` or `DBAAS_POLL_INTERVAL_SECONDS`.
 **The script restores the node; the application observes recovery and coordinates the requested repair.**
+
+Application SQL, parameters and transaction boundaries are written to `.local/sql-trace.log`; routine polling
+SQL is included so background database activity can be inspected. Maven tests use `.local/test-sql-trace.log` and capture
+detailed console output under `target/surefire-reports` or `target/failsafe-reports`.
+
+```powershell
+mvn clean verify
+mvn -Pintegration verify
+```
+
+The integration profile starts isolated Cassandra and PostgreSQL containers to check multi-instance coordination.
 
 ## Scope and next steps
 

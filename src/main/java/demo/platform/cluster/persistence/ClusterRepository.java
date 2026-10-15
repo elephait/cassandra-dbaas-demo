@@ -38,9 +38,12 @@ public class ClusterRepository {
             cluster.provisioningLeaseSeconds(), cluster.enabled());
     }
 
+    // For callers that already took the row lock through lockConfiguration in this same transaction.
+    // Re-issuing the locking SELECT would be pure overhead, so the entity is resolved from the
+    // persistence context when present and only looked up when it is genuinely new.
     @Transactional(propagation = Propagation.MANDATORY)
-    public ClusterRecord save(ClusterRecord cluster) {
-        ClusterEntity existing = entities.findLockedById(cluster.id()).orElse(null);
+    public ClusterRecord saveLocked(ClusterRecord cluster) {
+        ClusterEntity existing = entityManager.find(ClusterEntity.class, cluster.id());
         if (existing == null) return insert(cluster);
         return update(existing, cluster);
     }
@@ -51,10 +54,15 @@ public class ClusterRepository {
     }
 
     @Transactional(readOnly = true)
-    public List<ClusterRecord> list(boolean enabledOnly) {
-        return entities.findAll().stream().map(this::toDomain)
-            .filter(cluster -> !enabledOnly || cluster.enabled())
-            .sorted(Comparator.comparing(cluster -> cluster.id()))
+    public ClusterRecord.Settings getSettings(String clusterId) {
+        return entities.findSettings(clusterId).orElse(null);
+    }
+
+    // Scalar-only read for callers that only compare configuration versions.
+    @Transactional(readOnly = true)
+    public List<ClusterRecord.ConfigState> listEnabledConfigStates() {
+        return entities.findEnabledConfigStates().stream()
+            .map(state -> new ClusterRecord.ConfigState(state.getId(), state.getConfigVersion(), state.isEnabled()))
             .toList();
     }
 
@@ -84,4 +92,18 @@ public class ClusterRepository {
             entity.maxKeyspaces(), entity.provisioningLeaseSeconds(), entity.enabled(), entity.configVersion());
     }
 
+
+    @Transactional(readOnly = true)
+    public ClusterRecord.ConfigState getConfigState(String clusterId) {
+        return entities.findConfigState(clusterId)
+            .map(state -> new ClusterRecord.ConfigState(state.getId(), state.getConfigVersion(), state.isEnabled()))
+            .orElse(null);
+    }
+
+    @Transactional(readOnly = true)
+    public List<ClusterRecord.Summary> listSummaries() {
+        return entities.findSummaries().stream().map(summary -> new ClusterRecord.Summary(summary.getId(),
+            summary.getDatacenter(), summary.getExpectedNodes(), summary.getReplicationFactor(),
+            summary.isEnabled(), summary.getConfigVersion())).toList();
+    }
 }

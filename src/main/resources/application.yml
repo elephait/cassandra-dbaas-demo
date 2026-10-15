@@ -25,6 +25,7 @@ spring:
       hibernate.jdbc.time_zone: UTC
 
 demo:
+  poll-interval-seconds: ${DBAAS_POLL_INTERVAL_SECONDS:20}
   contact-points: ${DBAAS_CONTACT_POINTS:127.0.0.1:9042,127.0.0.1:9043,127.0.0.1:9044}
   datacenter: ${DBAAS_DATACENTER:dc1}
   cluster:

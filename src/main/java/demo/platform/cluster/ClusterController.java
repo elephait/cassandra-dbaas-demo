@@ -18,10 +18,18 @@ public class ClusterController {
     private final AdminAccess admin;
 
     @GetMapping("/clusters")
-    public List<ClusterResponse> clusters(
+    public List<ClusterRecord.Summary> clusters(
         @RequestHeader(value = "X-Admin-Token", required = false) String supplied) {
         admin.require(supplied);
-        return service.list().stream().map(ClusterResponse::from).toList();
+        return service.list();
+    }
+
+    @GetMapping("/clusters/{clusterId}")
+    public ClusterResponse cluster(
+        @PathVariable String clusterId,
+        @RequestHeader(value = "X-Admin-Token", required = false) String supplied) {
+        admin.require(supplied);
+        return ClusterResponse.from(service.details(clusterId));
     }
 
     @PutMapping("/clusters/{clusterId}")

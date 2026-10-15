@@ -26,7 +26,7 @@ public class ClusterConfigurationService {
     public ClusterConfiguration register(ClusterConfiguration configuration) {
         ClusterRecord previous = clusters.lockConfiguration(configuration.cluster().id());
         boolean bootstrap = previous == null || previous.configVersion() == 0;
-        ClusterRecord cluster = bootstrap ? clusters.save(configuration.cluster()) : previous;
+        ClusterRecord cluster = bootstrap ? clusters.saveLocked(configuration.cluster()) : previous;
         if (previous == null) queue.initializeCluster(cluster.id());
         RepairPolicy existing = repairs.getPolicy(cluster.id());
         RepairPolicy policy = bootstrap || existing == null
@@ -40,7 +40,7 @@ public class ClusterConfigurationService {
         // Lock first: provisioning and repair admission use this same cluster row.
         ClusterRecord previous = clusters.lockConfiguration(clusterId);
         if (previous != null) rejectUpdateWithPendingWork(clusterId);
-        ClusterRecord cluster = clusters.save(configuration.cluster());
+        ClusterRecord cluster = clusters.saveLocked(configuration.cluster());
         if (previous == null) queue.initializeCluster(clusterId);
         RepairPolicy policy = repairs.savePolicy(configuration.repairPolicy());
         return new ClusterConfiguration(cluster, policy);
@@ -60,11 +60,20 @@ public class ClusterConfigurationService {
         return policy == null ? null : new ClusterConfiguration(cluster, policy);
     }
 
-    @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
-    public List<ClusterConfiguration> list(boolean enabledOnly) {
-        var policies = repairs.listPolicies();
-        return clusters.list(enabledOnly).stream()
-            .map(cluster -> new ClusterConfiguration(cluster, policies.get(cluster.id())))
-            .toList();
+    // Session management compares configuration versions on a timer; it must not hydrate repair
+    // policies, contact points or address mappings to do that.
+    @Transactional(readOnly = true)
+    public List<ClusterRecord.ConfigState> listConnectionStates() {
+        return clusters.listEnabledConfigStates();
+    }
+
+    @Transactional(readOnly = true)
+    public ClusterRecord connectionDetails(String clusterId) {
+        return clusters.get(clusterId);
+    }
+
+    @Transactional(readOnly = true)
+    public ClusterRecord.ConfigState connectionState(String clusterId) {
+        return clusters.getConfigState(clusterId);
     }
 }

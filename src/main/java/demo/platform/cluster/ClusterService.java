@@ -3,6 +3,7 @@ package demo.platform.cluster;
 import demo.platform.cluster.ClusterRecord.ClusterConfiguration;
 import demo.platform.cluster.ClusterRegistryService;
 import demo.platform.misc.CassandraConnectionManager;
+import demo.platform.misc.ControlPlaneExceptions;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 
@@ -16,8 +17,14 @@ public class ClusterService {
     private final ClusterConfigurationService configurations;
     private final ClusterRegistryService clusters;
 
-    public List<ClusterConfiguration> list() {
-        return configurations.list(false);
+    public List<ClusterRecord.Summary> list() {
+        return clusters.list();
+    }
+
+    public ClusterConfiguration details(String clusterId) {
+        ClusterConfiguration configuration = configurations.get(clusterId);
+        if (configuration == null) throw new ControlPlaneExceptions.UnknownCluster(clusterId);
+        return configuration;
     }
 
     public ClusterConfiguration save(ClusterConfiguration configuration) {
@@ -30,7 +37,7 @@ public class ClusterService {
     }
 
     public Map<String, Object> health(String clusterId) {
-        ClusterRecord cluster = clusters.requireEnabled(clusterId);
+        ClusterRecord.Settings cluster = clusters.requireEnabled(clusterId);
         var available = connections.currentSession(cluster);
         if (available.isEmpty()) {
             return Map.of("clusterId", clusterId, "nodes", List.of(), "up", 0,

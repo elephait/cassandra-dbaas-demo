@@ -1,4 +1,9 @@
-param([string]$BaseUrl='http://localhost:8088', [string]$AdminToken='local-demo-only')
+param(
+    [string]$BaseUrl='http://localhost:8088',
+    [string]$AdminToken='local-demo-only',
+    [ValidateRange(1,2147483647)]
+    [int]$PollIntervalSeconds=$(if ($env:DBAAS_POLL_INTERVAL_SECONDS) { [int]$env:DBAAS_POLL_INTERVAL_SECONDS } else { 20 })
+)
 $ErrorActionPreference='Stop'
 if ($env:SPRING_PROFILES_ACTIVE -and $env:SPRING_PROFILES_ACTIVE -ne 'local') {
     throw 'verify-recovery.ps1 is local-only and cannot run with a non-local Spring profile'
@@ -30,7 +35,7 @@ try {
     $stopped=$false
     $deadline=(Get-Date).AddMinutes(10)
     do {
-        Start-Sleep -Seconds 5
+        Start-Sleep -Seconds $PollIntervalSeconds
         $health=Invoke-RestMethod "$BaseUrl/clusters/default/health"
     } while ($health.up -ne 3 -and (Get-Date) -lt $deadline)
     if ($health.up -ne 3) { throw 'Node recovery timed out' }
@@ -39,7 +44,7 @@ try {
     $op=Invoke-RestMethod "$BaseUrl/clusters/default/repair" -Method Post -Headers $headers -ContentType application/json -Body '{"keyspace":"interview","approved":true}'
     $deadline=(Get-Date).AddMinutes(46)
     do {
-        Start-Sleep -Seconds 3
+        Start-Sleep -Seconds $PollIntervalSeconds
         $status=Invoke-RestMethod "$BaseUrl/operations/$($op.id)" -Headers $headers
     } while ($status.state -in @('QUEUED','CLAIMED','RUNNING') -and (Get-Date) -lt $deadline)
     if ($status.state -ne 'SUCCEEDED') { throw "Repair did not succeed: $($status|ConvertTo-Json -Compress)" }

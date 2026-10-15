@@ -6,19 +6,11 @@ import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Lock;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.util.Map;
 import java.util.Optional;
-import java.util.stream.Collectors;
 
 public interface RepairPolicyRepository extends JpaRepository<RepairPolicyEntity, String> {
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     Optional<RepairPolicyEntity> findLockedByClusterId(String clusterId);
-
-    @Transactional(readOnly = true)
-    default Map<String, RepairPolicy> list() {
-        return findAll().stream().map(RepairPolicyRepository::toDomain)
-            .collect(Collectors.toMap(RepairPolicy::clusterId, policy -> policy));
-    }
 
     @Transactional(readOnly = true)
     default RepairPolicy get(String clusterId) {

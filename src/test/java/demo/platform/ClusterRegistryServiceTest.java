@@ -23,10 +23,10 @@ class ClusterRegistryServiceTest {
         var repository = mock(ClusterRepository.class);
         var registry = new ClusterRegistryService(repository);
         assertThrows(ControlPlaneExceptions.UnknownCluster.class, () -> registry.requireEnabled("default"));
-        when(repository.get("default")).thenReturn(cluster(false));
+        when(repository.getSettings("default")).thenReturn(cluster(false).settings());
         assertThrows(ControlPlaneExceptions.UnknownCluster.class, () -> registry.requireEnabled("default"));
-        var enabled = cluster(true);
-        when(repository.get("default")).thenReturn(enabled);
+        var enabled = cluster(true).settings();
+        when(repository.getSettings("default")).thenReturn(enabled);
         assertSame(enabled, registry.requireEnabled("default"));
     }
 

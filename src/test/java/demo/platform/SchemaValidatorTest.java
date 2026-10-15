@@ -28,8 +28,8 @@ class SchemaValidatorTest {
         var connections = mock(CassandraConnectionManager.class);
         var clusters = mock(ClusterRegistryService.class);
         var provisioning = mock(KeyspaceProvisioningService.class);
-        when(clusters.requireEnabled("default")).thenReturn(cluster());
-        when(connections.requireSession(any(ClusterRecord.class))).thenReturn(session);
+        when(clusters.requireEnabled("default")).thenReturn(cluster().settings());
+        when(connections.requireSession(any(ClusterRecord.Settings.class))).thenReturn(session);
         when(provisioning.begin(eq("default"), eq("team"), anyInt(), anyInt(), anyLong()))
             .thenReturn(new ProvisionDecision(false, "owner"));
         when(provisioning.owns("default", "team", "owner")).thenReturn(true);
@@ -60,8 +60,8 @@ class SchemaValidatorTest {
         var connections = mock(CassandraConnectionManager.class);
         var clusters = mock(ClusterRegistryService.class);
         var provisioning = mock(KeyspaceProvisioningService.class);
-        when(clusters.requireEnabled("default")).thenReturn(cluster());
-        when(connections.requireSession(any(ClusterRecord.class))).thenReturn(session);
+        when(clusters.requireEnabled("default")).thenReturn(cluster().settings());
+        when(connections.requireSession(any(ClusterRecord.Settings.class))).thenReturn(session);
         when(provisioning.begin(eq("default"), eq("team"), anyInt(), anyInt(), anyLong()))
             .thenReturn(new ProvisionDecision(false, "owner"));
         when(provisioning.owns("default", "team", "owner")).thenReturn(true);
@@ -85,8 +85,8 @@ class SchemaValidatorTest {
         var connections = mock(CassandraConnectionManager.class);
         var clusters = mock(ClusterRegistryService.class);
         var provisioning = mock(KeyspaceProvisioningService.class);
-        when(clusters.requireEnabled("default")).thenReturn(cluster());
-        when(connections.requireSession(any(ClusterRecord.class))).thenReturn(session);
+        when(clusters.requireEnabled("default")).thenReturn(cluster().settings());
+        when(connections.requireSession(any(ClusterRecord.Settings.class))).thenReturn(session);
         when(provisioning.begin(eq("default"), eq("team"), anyInt(), anyInt(), anyLong()))
             .thenReturn(new ProvisionDecision(false, "old-owner"));
         when(session.execute(any(SimpleStatement.class))).thenReturn(mock(ResultSet.class));
@@ -126,10 +126,10 @@ class SchemaValidatorTest {
         var connections = mock(CassandraConnectionManager.class);
         var clusters = mock(ClusterRegistryService.class);
         var provisioning = mock(KeyspaceProvisioningService.class);
-        when(connections.requireSession(any(demo.platform.cluster.ClusterRecord.class))).thenReturn(session);
+        when(connections.requireSession(any(demo.platform.cluster.ClusterRecord.Settings.class))).thenReturn(session);
         when(clusters.requireEnabled("default")).thenReturn(new ClusterRecord("default",
             List.of(new ContactPoint("127.0.0.1", 9042)),
-            "dc1", 3, 3, List.of(), 10, 60, 100, 60, true, 1));
+            "dc1", 3, 3, List.of(), 10, 60, 100, 60, true, 1).settings());
         when(provisioning.begin(eq("default"), eq("team"), anyInt(), anyInt(), anyLong()))
             .thenReturn(new ProvisionDecision(true, null));
         when(session.checkSchemaAgreement()).thenReturn(true);

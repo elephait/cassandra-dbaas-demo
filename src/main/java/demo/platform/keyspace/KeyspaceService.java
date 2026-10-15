@@ -36,7 +36,7 @@ public class KeyspaceService {
     public Map<String, Object> provision(String clusterId, String keyspace) {
         // Reject an unusable identifier before touching the registry or the Cassandra session.
         KeyspaceNames.validate(keyspace);
-        ClusterRecord cluster = clusters.requireEnabled(clusterId);
+        ClusterRecord.Settings cluster = clusters.requireEnabled(clusterId);
         CqlSession session = connections.requireSession(cluster);
         ProvisionDecision decision = provisioning.begin(clusterId, keyspace,
             cluster.maxKeyspaces(), cluster.provisioningLeaseSeconds(), cluster.configVersion());
@@ -60,7 +60,7 @@ public class KeyspaceService {
         if (value == null || value.length() > 1024)
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
                 "Value must contain at most 1024 characters");
-        ClusterRecord cluster = clusters.requireEnabled(clusterId);
+        ClusterRecord.Settings cluster = clusters.requireEnabled(clusterId);
         CqlSession session = connections.requireSession(cluster);
         UUID row = UUID.randomUUID();
         session.execute(SimpleStatement.newInstance(
@@ -75,7 +75,7 @@ public class KeyspaceService {
             "consistency", "LOCAL_QUORUM");
     }
 
-    private void provisionOwned(ClusterRecord cluster, String keyspace,
+    private void provisionOwned(ClusterRecord.Settings cluster, String keyspace,
                                 String owner, CqlSession session) {
         AtomicBoolean lost = new AtomicBoolean();
         int heartbeatSeconds = Math.max(1, cluster.provisioningLeaseSeconds() / 3);
@@ -112,12 +112,12 @@ public class KeyspaceService {
         }
     }
 
-    private void assertOwner(ClusterRecord cluster, String keyspace, String owner, AtomicBoolean lost) {
+    private void assertOwner(ClusterRecord.Settings cluster, String keyspace, String owner, AtomicBoolean lost) {
         if (lost.get() || !provisioning.owns(cluster.id(), keyspace, owner))
             throw new ControlPlaneExceptions.Conflict("Provisioning ownership was lost before DDL");
     }
 
-    private void renewLease(ClusterRecord cluster, String keyspace, String owner, AtomicBoolean lost) {
+    private void renewLease(ClusterRecord.Settings cluster, String keyspace, String owner, AtomicBoolean lost) {
         if (lost.get()) return;
         try {
             if (!provisioning.renew(cluster.id(), keyspace, owner,

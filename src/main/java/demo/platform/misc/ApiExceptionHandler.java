@@ -58,10 +58,16 @@ public class ApiExceptionHandler {
         private int maxKeyspaces;
         private String adminToken;
         private int provisioningLeaseSeconds = 60;
+        private int pollIntervalSeconds = 20;
         private Cluster cluster = new Cluster();
         private Cassandra cassandra = new Cassandra();
         private AddressTranslation addressTranslation = new AddressTranslation();
         private Repair repair = new Repair();
+
+        public void setPollIntervalSeconds(int seconds) {
+            if (seconds < 1) throw new IllegalArgumentException("Poll interval must be at least one second");
+            this.pollIntervalSeconds = seconds;
+        }
 
         @Data
         public static class Cluster {

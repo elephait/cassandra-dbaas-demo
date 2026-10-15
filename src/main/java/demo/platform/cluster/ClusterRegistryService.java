@@ -7,14 +7,18 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.util.List;
+
 @Service
 @RequiredArgsConstructor
 public class ClusterRegistryService {
     private final ClusterRepository clusters;
 
     @Transactional(readOnly = true)
-    public ClusterRecord requireEnabled(String clusterId) {
-        return requireEnabled(clusterId, clusters.get(clusterId));
+    public ClusterRecord.Settings requireEnabled(String clusterId) {
+        var settings = clusters.getSettings(clusterId);
+        if (settings == null || !settings.enabled()) throw new ControlPlaneExceptions.UnknownCluster(clusterId);
+        return settings;
     }
 
     // Admission belongs to the caller's transaction: the cluster lock must remain held until its
@@ -34,5 +38,10 @@ public class ClusterRegistryService {
     private static ClusterRecord requireEnabled(String clusterId, ClusterRecord cluster) {
         if (cluster == null || !cluster.enabled()) throw new ControlPlaneExceptions.UnknownCluster(clusterId);
         return cluster;
+    }
+
+    @Transactional(readOnly = true)
+    public List<ClusterRecord.Summary> list() {
+        return clusters.listSummaries();
     }
 }

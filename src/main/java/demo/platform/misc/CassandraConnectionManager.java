@@ -84,16 +84,16 @@ public class CassandraConnectionManager {
         if (configurations == null) return;
         configurations.register(defaultConfiguration());
         connector.scheduleWithFixedDelay(this::refresh, 0,
-            Math.min(5, bootstrap.getCassandra().getReconnectSeconds()), TimeUnit.SECONDS);
+            bootstrap.getPollIntervalSeconds(), TimeUnit.SECONDS);
     }
 
-    public Optional<CqlSession> currentSession(ClusterRecord cluster) {
+    public Optional<CqlSession> currentSession(ClusterRecord.Settings cluster) {
         SessionHolder holder = sessions.get(cluster.id());
         return holder == null || holder.configVersion() != cluster.configVersion()
             ? Optional.empty() : Optional.of(holder.session());
     }
 
-    public CqlSession requireSession(ClusterRecord cluster) {
+    public CqlSession requireSession(ClusterRecord.Settings cluster) {
         SessionHolder holder = sessions.get(cluster.id());
         if (holder == null || holder.configVersion() != cluster.configVersion())
             throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE, "Cluster session is reconnecting to the current configuration");
@@ -117,19 +117,21 @@ public class CassandraConnectionManager {
     void refresh() {
         if (closing.get() || configurations == null) return;
         try {
-            var enabled = configurations.list(true).stream().map(ClusterConfiguration::cluster).toList();
-            var enabledIds = enabled.stream().map(ClusterRecord::id)
+            // Scalar-only: periodic refresh must not hydrate cluster contact points,
+            // address mappings or repair policies just to compare a configuration version.
+            var enabled = configurations.listConnectionStates();
+            var enabledIds = enabled.stream().map(ClusterRecord.ConfigState::clusterId)
                 .collect(Collectors.toSet());
             sessions.keySet().stream().filter(id -> !enabledIds.contains(id)).toList().forEach(this::invalidate);
-            for (var cluster : enabled) {
-                String clusterId = cluster.id();
+            for (var state : enabled) {
+                String clusterId = state.clusterId();
                 SessionHolder existing = sessions.get(clusterId);
-                if ((existing == null || existing.configVersion() != cluster.configVersion())
+                if ((existing == null || existing.configVersion() != state.configVersion())
                     && System.nanoTime() >= nextAttempts.getOrDefault(clusterId, 0L) && connecting.add(clusterId)) {
                     try {
                         connectionWorkers.submit(() -> {
                             try {
-                                connectIfNeeded(cluster);
+                                connectIfNeeded(clusterId, state.configVersion());
                             } finally {
                                 connecting.remove(clusterId);
                             }
@@ -144,31 +146,43 @@ public class CassandraConnectionManager {
         }
     }
 
-    private void connectIfNeeded(ClusterRecord cluster) {
-        String clusterId = cluster.id();
+    private void connectIfNeeded(String clusterId, long expectedConfigVersion) {
         SessionHolder existing = sessions.get(clusterId);
-        if (existing != null && existing.configVersion() == cluster.configVersion()) return;
-        if (existing != null) invalidate(clusterId);
+        if (existing != null && existing.configVersion() == expectedConfigVersion) return;
+        CqlSession candidate = null;
+        boolean published = false;
+        int reconnectSeconds = bootstrap.getCassandra().getReconnectSeconds();
         try {
-            CqlSession session = buildSession(cluster);
-            ClusterConfiguration latest = configurations.get(clusterId);
+            ClusterRecord cluster = configurations.connectionDetails(clusterId);
+            if (cluster == null || !cluster.enabled() || cluster.configVersion() != expectedConfigVersion) return;
+            reconnectSeconds = cluster.reconnectSeconds();
+            if (existing != null) invalidate(clusterId);
+            candidate = buildSession(cluster);
+            // A slow connection must not publish a session for a disabled or superseded configuration.
+            var current = configurations.connectionState(clusterId);
             synchronized (publicationLock) {
-                if (closing.get() || latest == null || !latest.cluster().enabled()
-                    || latest.cluster().configVersion() != cluster.configVersion()) {
-                    session.close();
-                    return;
-                }
-                SessionHolder raced = sessions.putIfAbsent(clusterId, new SessionHolder(cluster.configVersion(), session));
-                if (raced != null) session.close();
-                else {
+                if (closing.get() || current == null || !current.enabled()
+                    || current.configVersion() != cluster.configVersion()) return;
+                SessionHolder raced = sessions.putIfAbsent(clusterId,
+                    new SessionHolder(cluster.configVersion(), candidate));
+                if (raced == null) {
+                    published = true;
                     nextAttempts.remove(clusterId);
-                    log.info("Connected to Cassandra cluster {} at configuration version {}", clusterId, cluster.configVersion());
+                    log.info("Connected to Cassandra cluster {} at configuration version {}", clusterId,
+                        cluster.configVersion());
                 }
             }
         } catch (RuntimeException exception) {
-            nextAttempts.put(clusterId, System.nanoTime() + TimeUnit.SECONDS.toNanos(cluster.reconnectSeconds()));
-            log.warn("Cassandra cluster {} is unavailable; retrying in {} seconds: {}",
-                clusterId, cluster.reconnectSeconds(), exception.getMessage());
+            nextAttempts.put(clusterId, System.nanoTime() + TimeUnit.SECONDS.toNanos(reconnectSeconds));
+            log.warn("Cassandra cluster {} could not connect; retrying: {}", clusterId, exception.getMessage());
+        } finally {
+            if (candidate != null && !published) {
+                try {
+                    candidate.close();
+                } catch (RuntimeException closeFailure) {
+                    log.warn("Cannot close unpublished Cassandra session for {}", clusterId, closeFailure);
+                }
+            }
         }
     }
 

@@ -15,7 +15,9 @@ demo:
 
 # Keep one timestamped SQL line per statement; bind values and transaction boundaries follow
 # on the same thread. Include JdbcTemplate so repair queue transitions are visible as well.
+# Include polling threads so the trace shows background database work as well as requests.
 logging:
+  config: classpath:logback-local.xml
   file:
     name: ${DBAAS_SQL_LOG_FILE:./.local/sql-trace.log}
   pattern:

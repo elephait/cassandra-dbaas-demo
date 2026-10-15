@@ -38,6 +38,16 @@ public record ClusterRecord(
             throw new IllegalArgumentException("Discovered address mappings must be unique");
     }
 
+    public Settings settings() {
+        return new Settings(id, datacenter, expectedNodes, replicationFactor, maxKeyspaces,
+            provisioningLeaseSeconds, enabled, configVersion);
+    }
+
+    // Operational reads need current scalar settings, not connection collections.
+    public record Settings(String id, String datacenter, int expectedNodes, int replicationFactor,
+                           int maxKeyspaces, int provisioningLeaseSeconds, boolean enabled, long configVersion) {
+    }
+
     public ClusterRecord withVersion(long version) {
         return new ClusterRecord(id, contactPoints, datacenter, expectedNodes, replicationFactor,
             addressMappings, requestTimeoutSeconds, reconnectSeconds, maxKeyspaces,
@@ -75,5 +85,14 @@ public record ClusterRecord(
             if (!cluster.id().equals(repairPolicy.clusterId()))
                 throw new IllegalArgumentException("Cluster and repair policy ids must match");
         }
+    }
+
+    // Inventory contains scalars only; full connection settings and repair policy belong to details.
+    public record Summary(String id, String datacenter, int expectedNodes, int replicationFactor,
+                          boolean enabled, long configVersion) {
+    }
+
+    // Connection polling needs only identity, version and enablement.
+    public record ConfigState(String clusterId, long configVersion, boolean enabled) {
     }
 }

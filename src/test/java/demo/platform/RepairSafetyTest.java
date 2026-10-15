@@ -142,7 +142,7 @@ class RepairSafetyTest {
         var properties = new ApiExceptionHandler.CassandraProperties();
         properties.getRepair().setWorkerThreads(1);
         var connections = mock(CassandraConnectionManager.class);
-        when(connections.requireSession(any(ClusterRecord.class)))
+        when(connections.requireSession(any(ClusterRecord.Settings.class)))
             .thenThrow(new IllegalStateException("Cassandra unavailable before dispatch"));
         var runner = mock(RepairCommandRunner.class);
         var service = new RepairWorker(properties, clusters, execution, claims, repairConfiguration, connections, runner);
