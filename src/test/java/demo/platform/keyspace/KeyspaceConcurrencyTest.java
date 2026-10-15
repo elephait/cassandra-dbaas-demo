@@ -1,14 +1,17 @@
 package demo.platform.keyspace;
 
+import demo.platform.cluster.ClusterRegistryService;
+import demo.platform.repair.RepairQueueService;
+import demo.platform.keyspace.KeyspaceProvisioningService;
+import demo.platform.repair.RepairConfigurationService;
+import demo.platform.cluster.ClusterConfigurationService;
 import demo.platform.cluster.ClusterRecord;
 import demo.platform.cluster.ClusterRecord.ClusterConfiguration;
 import demo.platform.cluster.ClusterRecord.ContactPoint;
-import demo.platform.cluster.persistence.ClusterConfigurationRepository;
 import demo.platform.cluster.persistence.ClusterRepository;
 import demo.platform.keyspace.persistence.KeyspaceEntity;
 import demo.platform.keyspace.persistence.KeyspaceId;
 import demo.platform.keyspace.persistence.KeyspaceJpaRepository;
-import demo.platform.keyspace.persistence.KeyspaceRepository;
 import demo.platform.misc.ControlPlaneExceptions;
 import demo.platform.repair.OperationRecord.RepairPolicy;
 import org.junit.jupiter.api.Test;
@@ -31,13 +34,13 @@ import java.util.function.IntFunction;
 import static org.junit.jupiter.api.Assertions.*;
 
 @DataJpaTest(showSql = false)
-@Import({ClusterRepository.class, ClusterConfigurationRepository.class, KeyspaceRepository.class})
+@Import({ClusterRepository.class, ClusterConfigurationService.class, KeyspaceProvisioningService.class, RepairConfigurationService.class, ClusterRegistryService.class, RepairQueueService.class})
 @Transactional(propagation = Propagation.NOT_SUPPORTED)
 class KeyspaceConcurrencyTest {
     @Autowired
-    ClusterConfigurationRepository configurations;
+    ClusterConfigurationService configurations;
     @Autowired
-    KeyspaceRepository provisioning;
+    KeyspaceProvisioningService provisioning;
     @Autowired
     KeyspaceJpaRepository keyspaces;
     @Autowired

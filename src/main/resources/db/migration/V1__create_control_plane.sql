@@ -52,6 +52,9 @@ CREATE TABLE keyspaces (
     PRIMARY KEY (cluster_id, keyspace_name)
 );
 
+-- Covers configuration-update checks; renew/complete/owns already use the composite primary key.
+CREATE INDEX keyspaces_active_provisioning ON keyspaces(cluster_id, state, owner_id, expires_at);
+
 CREATE TABLE operations (
     operation_id VARCHAR(36) PRIMARY KEY,
     cluster_id VARCHAR(64) NOT NULL REFERENCES clusters(cluster_id),

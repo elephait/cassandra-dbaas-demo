@@ -1,8 +1,7 @@
 package demo.platform.cluster;
 
 import demo.platform.cluster.ClusterRecord.ClusterConfiguration;
-import demo.platform.cluster.persistence.ClusterConfigurationRepository;
-import demo.platform.cluster.persistence.ClusterRepository;
+import demo.platform.cluster.ClusterRegistryService;
 import demo.platform.misc.CassandraConnectionManager;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
@@ -14,8 +13,8 @@ import java.util.Map;
 @RequiredArgsConstructor
 public class ClusterService {
     private final CassandraConnectionManager connections;
-    private final ClusterConfigurationRepository configurations;
-    private final ClusterRepository clusters;
+    private final ClusterConfigurationService configurations;
+    private final ClusterRegistryService clusters;
 
     public List<ClusterConfiguration> list() {
         return configurations.list(false);

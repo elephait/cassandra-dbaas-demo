@@ -1,12 +1,11 @@
 package demo.platform.repair;
 
 import demo.platform.cluster.ClusterRecord;
-import demo.platform.cluster.persistence.ClusterRepository;
-import demo.platform.misc.CassandraConnectionManager;
+import demo.platform.cluster.ClusterRegistryService;
 import demo.platform.keyspace.KeyspaceNames;
+import demo.platform.misc.CassandraConnectionManager;
 import demo.platform.repair.OperationRecord.RepairOperation;
 import demo.platform.repair.persistence.RepairExecutionRepository;
-import demo.platform.repair.persistence.RepairQueueRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
@@ -19,8 +18,8 @@ import java.util.UUID;
 @RequiredArgsConstructor
 public class RepairCoordinator {
     private final CassandraConnectionManager connections;
-    private final ClusterRepository clusters;
-    private final RepairQueueRepository queue;
+    private final ClusterRegistryService clusters;
+    private final RepairQueueService queue;
     private final RepairExecutionRepository execution;
 
     private static RepairOperation toView(OperationRecord operation) {

@@ -1,24 +1,23 @@
 package demo.platform;
 
-import demo.platform.cluster.ClusterRecord;
 import demo.platform.cluster.ClusterRecord.ContactPoint;
-import demo.platform.cluster.persistence.ClusterRepository;
+import demo.platform.cluster.ClusterRecord;
 import demo.platform.misc.ControlPlaneExceptions;
-import demo.platform.repair.OperationRecord;
 import demo.platform.repair.OperationRecord.RepairPolicy;
+import demo.platform.repair.OperationRecord;
+import demo.platform.repair.RepairClaimService;
+import demo.platform.repair.RepairConfigurationService;
 import demo.platform.repair.RepairState;
 import demo.platform.repair.persistence.RepairExecutionRepository;
-import demo.platform.repair.persistence.RepairPolicyRepository;
-import demo.platform.repair.persistence.RepairQueueRepository;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.Test;
-import org.testcontainers.junit.jupiter.Testcontainers;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.postgresql.PostgreSQLContainer;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
 import org.springframework.transaction.support.TransactionTemplate;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+import org.testcontainers.postgresql.PostgreSQLContainer;
 
 import java.util.List;
 import java.util.UUID;
@@ -27,7 +26,6 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
-import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -37,14 +35,20 @@ class PostgreSQLQueueIT {
     static final PostgreSQLContainer postgres = new PostgreSQLContainer("postgres:17.6")
         .withDatabaseName("queue_test").withUsername("postgres").withPassword("integration-only");
 
-    private static RepairExecutionRepository execution(JdbcTemplate jdbc, TransactionTemplate transactions) {
-        ClusterRepository clusters = mock(ClusterRepository.class);
-        RepairPolicyRepository policies = mock(RepairPolicyRepository.class);
-        RepairQueueRepository queue = mock(RepairQueueRepository.class);
-        when(clusters.get("default")).thenReturn(cluster());
-        when(policies.get("default")).thenReturn(policy());
-        when(queue.get(any(UUID.class))).thenAnswer(invocation -> operation(jdbc, invocation.getArgument(0)));
-        return new RepairExecutionRepository(jdbc, transactions, clusters, queue, policies);
+    private record Worker(RepairExecutionRepository execution, RepairClaimService claims) {
+    }
+
+    private static Worker worker(JdbcTemplate jdbc, TransactionTemplate transactions) {
+        RepairConfigurationService repairConfiguration = mock(RepairConfigurationService.class);
+        when(repairConfiguration.getPolicy("default")).thenReturn(policy());
+        var execution = new RepairExecutionRepository(jdbc, transactions);
+        var claims = new RepairClaimService(execution, repairConfiguration) {
+            @Override
+            public OperationRecord claim(int seconds) {
+                return transactions.execute(status -> super.claim(seconds));
+            }
+        };
+        return new Worker(execution, claims);
     }
 
     private static OperationRecord operation(JdbcTemplate jdbc, UUID id) {
@@ -82,20 +86,20 @@ class PostgreSQLQueueIT {
                 + "VALUES (?, 'default', 'queue_test', 'QUEUED', 'queued', CURRENT_TIMESTAMP, ?, 1)",
             operationId.toString(), UUID.randomUUID().toString());
 
-        RepairExecutionRepository a = execution(aJdbc,
+        Worker a = worker(aJdbc,
             new TransactionTemplate(new DataSourceTransactionManager(aDataSource)));
-        RepairExecutionRepository b = execution(bJdbc,
+        Worker b = worker(bJdbc,
             new TransactionTemplate(new DataSourceTransactionManager(bDataSource)));
         var pool = Executors.newFixedThreadPool(2);
         var gate = new CountDownLatch(1);
         try {
             var firstClaim = pool.submit(() -> {
                 gate.await();
-                return a.claim(60);
+                return a.claims().claim(60);
             });
             var secondClaim = pool.submit(() -> {
                 gate.await();
-                return b.claim(60);
+                return b.claims().claim(60);
             });
             gate.countDown();
             var first = firstClaim.get(10, TimeUnit.SECONDS);
@@ -105,22 +109,22 @@ class PostgreSQLQueueIT {
             assertEquals(operationId, old.id());
             aJdbc.update("UPDATE repair_locks SET expires_at = CURRENT_TIMESTAMP - INTERVAL '1 second' "
                 + "WHERE owner_id = ?", old.owner());
-            b.reconcileExpired();
-            var replacement = b.claim(60);
+            b.execution().reconcileExpired();
+            var replacement = b.claims().claim(60);
             assertNotEquals(old.owner(), replacement.owner());
-            assertFalse(a.renew(old.owner(), 60));
-            assertThrows(ControlPlaneExceptions.Conflict.class, () -> a.markDispatched(old));
-            b.markDispatched(replacement);
+            assertFalse(a.execution().renew(old.owner(), 60));
+            assertThrows(ControlPlaneExceptions.Conflict.class, () -> a.execution().markDispatched(old));
+            b.execution().markDispatched(replacement);
             aJdbc.update("UPDATE repair_locks SET expires_at = CURRENT_TIMESTAMP - INTERVAL '1 second' "
                 + "WHERE owner_id = ?", replacement.owner());
-            a.reconcileExpired();
+            a.execution().reconcileExpired();
             assertEquals(RepairState.UNKNOWN, operation(aJdbc, operationId).state());
-            assertNull(a.claim(60));
-            var acknowledgementA = pool.submit(() -> a.acknowledge(operationId));
-            var acknowledgementB = pool.submit(() -> b.acknowledge(operationId));
+            assertNull(a.claims().claim(60));
+            var acknowledgementA = pool.submit(() -> a.execution().acknowledge(operationId));
+            var acknowledgementB = pool.submit(() -> b.execution().acknowledge(operationId));
             acknowledgementA.get(10, TimeUnit.SECONDS);
             acknowledgementB.get(10, TimeUnit.SECONDS);
-            a.acknowledge(operationId);
+            a.execution().acknowledge(operationId);
         } finally {
             pool.shutdownNow();
         }

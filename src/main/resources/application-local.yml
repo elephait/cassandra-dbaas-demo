@@ -1,4 +1,8 @@
 spring:
+  jpa:
+    show-sql: false
+    properties:
+      hibernate.format_sql: false
   datasource:
     url: jdbc:h2:file:${DBAAS_LOCAL_DB_PATH:./.local/control-plane-keyspaces};DB_CLOSE_ON_EXIT=FALSE;WRITE_DELAY=0
     username: sa
@@ -8,3 +12,20 @@ spring:
 demo:
   control-plane:
     environment: local
+
+# Keep one timestamped SQL line per statement; bind values and transaction boundaries follow
+# on the same thread. Include JdbcTemplate so repair queue transitions are visible as well.
+logging:
+  file:
+    name: ${DBAAS_SQL_LOG_FILE:./.local/sql-trace.log}
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] %logger{60} - %msg%n"
+    file: "%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] %logger{60} - %msg%n"
+  level:
+    root: INFO
+    org.hibernate: INFO
+    org.hibernate.SQL: DEBUG
+    org.hibernate.orm.jdbc.bind: TRACE
+    org.springframework.jdbc.core.JdbcTemplate: DEBUG
+    org.springframework.jdbc.core.StatementCreatorUtils: TRACE
+    org.springframework.orm.jpa.JpaTransactionManager: DEBUG

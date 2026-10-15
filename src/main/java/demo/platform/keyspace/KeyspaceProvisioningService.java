@@ -1,26 +1,26 @@
-package demo.platform.keyspace.persistence;
+package demo.platform.keyspace;
 
-import demo.platform.cluster.persistence.ClusterRepository;
-import demo.platform.misc.ControlPlaneExceptions;
-import demo.platform.keyspace.KeyspaceNames;
-import demo.platform.keyspace.KeyspaceRecord;
+import demo.platform.cluster.ClusterRegistryService;
 import demo.platform.keyspace.KeyspaceRecord.ProvisionDecision;
-import demo.platform.keyspace.ProvisioningState;
+import demo.platform.keyspace.persistence.KeyspaceEntity;
+import demo.platform.keyspace.persistence.KeyspaceId;
+import demo.platform.keyspace.persistence.KeyspaceJpaRepository;
+import demo.platform.misc.ControlPlaneExceptions;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.PageRequest;
-import org.springframework.stereotype.Repository;
-import org.springframework.transaction.annotation.Transactional;
+import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Isolation;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
 
-@Repository
+@Service
 @RequiredArgsConstructor
-public class KeyspaceRepository {
+public class KeyspaceProvisioningService {
     private final KeyspaceJpaRepository keyspaces;
-    private final ClusterRepository clusters;
+    private final ClusterRegistryService clusters;
 
     @Transactional(isolation = Isolation.READ_COMMITTED)
     public ProvisionDecision begin(String clusterId, String keyspace, int maxKeyspaces, int leaseSeconds) {
@@ -34,9 +34,7 @@ public class KeyspaceRepository {
         if (leaseSeconds < 3) throw new IllegalArgumentException("Provisioning lease must be at least three seconds");
         // Lock before counting: READ_COMMITTED observes the preceding owner's committed reservation.
         // This serializes same-cluster admission across replicas, including absent keyspaces.
-        clusters.lockEnabled(clusterId);
-        if (expectedConfigVersion >= 0 && clusters.get(clusterId).configVersion() != expectedConfigVersion)
-            throw new ControlPlaneExceptions.Conflict("Cluster configuration changed before provisioning admission; retry");
+        clusters.lockForAdmission(clusterId, expectedConfigVersion);
         var id = new KeyspaceId(clusterId, keyspace);
         KeyspaceEntity existing = keyspaces.findById(id).orElse(null);
         Instant now = keyspaces.databaseTime().toInstant();
@@ -76,6 +74,11 @@ public class KeyspaceRepository {
     @Transactional(readOnly = true)
     public boolean owns(String clusterId, String keyspace, String owner) {
         return keyspaces.owns(new KeyspaceId(clusterId, keyspace), owner, ProvisioningState.PROVISIONING);
+    }
+
+    @Transactional(readOnly = true)
+    public boolean hasPendingWork(String clusterId) {
+        return keyspaces.countProvisioningByState(clusterId, ProvisioningState.PROVISIONING) > 0;
     }
 
     @Transactional(readOnly = true)

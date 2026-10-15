@@ -1,19 +1,14 @@
 package demo.platform.misc;
 
-import java.util.Arrays;
-import java.util.Set;
-import java.util.stream.Collectors;
-
 import com.datastax.oss.driver.api.core.CqlSession;
 import com.datastax.oss.driver.api.core.config.DefaultDriverOption;
 import com.datastax.oss.driver.api.core.config.DriverConfigLoader;
+import demo.platform.cluster.ClusterConfigurationService;
 import demo.platform.cluster.ClusterRecord;
 import demo.platform.cluster.ClusterRecord.AddressMapping;
 import demo.platform.cluster.ClusterRecord.ClusterConfiguration;
 import demo.platform.cluster.ClusterRecord.ContactPoint;
 import demo.platform.cluster.LocalAddressTranslator;
-import demo.platform.cluster.persistence.ClusterConfigurationRepository;
-import demo.platform.cluster.persistence.ClusterRepository;
 import demo.platform.repair.OperationRecord.RepairPolicy;
 import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
@@ -25,11 +20,14 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.server.ResponseStatusException;
 
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Collectors;
 
 @Component
 @Slf4j
@@ -46,11 +44,11 @@ public class CassandraConnectionManager {
     private final Object publicationLock = new Object();
     private final ExecutorService connectionWorkers;
     private final ApiExceptionHandler.CassandraProperties bootstrap;
-    private final ClusterConfigurationRepository configurations;
+    private final ClusterConfigurationService configurations;
 
     @Autowired
     public CassandraConnectionManager(ApiExceptionHandler.CassandraProperties bootstrap,
-                                      ClusterConfigurationRepository configurations) {
+                                      ClusterConfigurationService configurations) {
         this.bootstrap = bootstrap;
         this.configurations = configurations;
         int threads = bootstrap.getCassandra().getConnectionThreads();
@@ -190,7 +188,7 @@ public class CassandraConnectionManager {
     }
 
     private ClusterConfiguration defaultConfiguration() {
-        String id = ClusterRepository.DEFAULT_CLUSTER;
+        String id = ClusterRecord.DEFAULT_CLUSTER;
         List<ContactPoint> points = split(bootstrap.getContactPoints()).stream()
             .map(CassandraConnectionManager::contactPoint).toList();
         List<AddressMapping> mappings = bootstrap.getAddressTranslation().isEnabled()

@@ -6,17 +6,17 @@ import com.datastax.oss.driver.api.core.cql.Row;
 import com.datastax.oss.driver.api.core.cql.SimpleStatement;
 import demo.platform.cluster.ClusterRecord;
 import demo.platform.cluster.ClusterRecord.ContactPoint;
-import demo.platform.cluster.persistence.ClusterRepository;
-import demo.platform.misc.CassandraConnectionManager;
-import demo.platform.misc.ControlPlaneExceptions;
+import demo.platform.cluster.ClusterRegistryService;
+import demo.platform.keyspace.KeyspaceProvisioningService;
 import demo.platform.keyspace.KeyspaceRecord.ProvisionDecision;
 import demo.platform.keyspace.KeyspaceService;
 import demo.platform.keyspace.SchemaValidator;
-import demo.platform.keyspace.persistence.KeyspaceRepository;
+import demo.platform.misc.CassandraConnectionManager;
+import demo.platform.misc.ControlPlaneExceptions;
 import org.junit.jupiter.api.Test;
 
-import java.util.Map;
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
@@ -26,8 +26,8 @@ class SchemaValidatorTest {
     void cleanupFailurePreservesOriginalProvisioningFailure() {
         var session = mock(CqlSession.class);
         var connections = mock(CassandraConnectionManager.class);
-        var clusters = mock(ClusterRepository.class);
-        var provisioning = mock(KeyspaceRepository.class);
+        var clusters = mock(ClusterRegistryService.class);
+        var provisioning = mock(KeyspaceProvisioningService.class);
         when(clusters.requireEnabled("default")).thenReturn(cluster());
         when(connections.requireSession(any(ClusterRecord.class))).thenReturn(session);
         when(provisioning.begin(eq("default"), eq("team"), anyInt(), anyInt(), anyLong()))
@@ -58,8 +58,8 @@ class SchemaValidatorTest {
     void failedDdlReleasesOwnershipWithoutPublishingReady() {
         var session = mock(CqlSession.class);
         var connections = mock(CassandraConnectionManager.class);
-        var clusters = mock(ClusterRepository.class);
-        var provisioning = mock(KeyspaceRepository.class);
+        var clusters = mock(ClusterRegistryService.class);
+        var provisioning = mock(KeyspaceProvisioningService.class);
         when(clusters.requireEnabled("default")).thenReturn(cluster());
         when(connections.requireSession(any(ClusterRecord.class))).thenReturn(session);
         when(provisioning.begin(eq("default"), eq("team"), anyInt(), anyInt(), anyLong()))
@@ -83,8 +83,8 @@ class SchemaValidatorTest {
     void lostProvisioningOwnerCannotExecuteDdl() {
         var session = mock(CqlSession.class);
         var connections = mock(CassandraConnectionManager.class);
-        var clusters = mock(ClusterRepository.class);
-        var provisioning = mock(KeyspaceRepository.class);
+        var clusters = mock(ClusterRegistryService.class);
+        var provisioning = mock(KeyspaceProvisioningService.class);
         when(clusters.requireEnabled("default")).thenReturn(cluster());
         when(connections.requireSession(any(ClusterRecord.class))).thenReturn(session);
         when(provisioning.begin(eq("default"), eq("team"), anyInt(), anyInt(), anyLong()))
@@ -124,8 +124,8 @@ class SchemaValidatorTest {
     void readyKeyspaceIsRevalidatedAndDriftIsRejectedWithoutDdl() {
         var session = mock(CqlSession.class);
         var connections = mock(CassandraConnectionManager.class);
-        var clusters = mock(ClusterRepository.class);
-        var provisioning = mock(KeyspaceRepository.class);
+        var clusters = mock(ClusterRegistryService.class);
+        var provisioning = mock(KeyspaceProvisioningService.class);
         when(connections.requireSession(any(demo.platform.cluster.ClusterRecord.class))).thenReturn(session);
         when(clusters.requireEnabled("default")).thenReturn(new ClusterRecord("default",
             List.of(new ContactPoint("127.0.0.1", 9042)),

@@ -100,6 +100,16 @@
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
             </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <redirectTestOutputToFile>true</redirectTestOutputToFile>
+                    <systemPropertyVariables>
+                        <logging.file.name>${project.basedir}/.local/test-sql-trace.log</logging.file.name>
+                    </systemPropertyVariables>
+                </configuration>
+            </plugin>
         </plugins>
     </build>
     <profiles>
@@ -120,6 +130,10 @@
                         </executions>
                         <configuration>
                             <failIfNoTests>true</failIfNoTests>
+                            <redirectTestOutputToFile>true</redirectTestOutputToFile>
+                            <systemPropertyVariables>
+                                <logging.file.name>${project.basedir}/.local/test-sql-trace.log</logging.file.name>
+                            </systemPropertyVariables>
                         </configuration>
                     </plugin>
                 </plugins>

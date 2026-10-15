@@ -1,13 +1,15 @@
 package demo.platform;
 
+import demo.platform.cluster.ClusterRegistryService;
 import demo.platform.cluster.persistence.ClusterRepository;
+import demo.platform.keyspace.KeyspaceProvisioningService;
 import demo.platform.misc.ControlPlaneExceptions;
-import demo.platform.keyspace.persistence.KeyspaceRepository;
 import demo.platform.repair.OperationRecord;
+import demo.platform.repair.RepairClaimService;
+import demo.platform.repair.RepairConfigurationService;
+import demo.platform.repair.RepairQueueService;
 import demo.platform.repair.RepairState;
 import demo.platform.repair.persistence.RepairExecutionRepository;
-import demo.platform.repair.persistence.RepairPolicyRepository;
-import demo.platform.repair.persistence.RepairQueueRepository;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.data.jpa.test.autoconfigure.DataJpaTest;
@@ -20,7 +22,7 @@ import java.util.UUID;
 import static org.junit.jupiter.api.Assertions.*;
 
 @DataJpaTest(properties = "spring.datasource.url=jdbc:h2:mem:control-plane-test;DB_CLOSE_DELAY=-1")
-@Import({ClusterRepository.class, KeyspaceRepository.class,     RepairQueueRepository.class, RepairExecutionRepository.class})
+@Import({ClusterRepository.class, KeyspaceProvisioningService.class, RepairQueueService.class, RepairExecutionRepository.class, RepairClaimService.class, RepairConfigurationService.class, ClusterRegistryService.class})
 class ControlPlaneRepositoryTest {
     @Test
     void expiredProvisioningOwnerCannotPublishReady() {
@@ -36,11 +38,13 @@ class ControlPlaneRepositoryTest {
     }
 
     @Autowired
-    KeyspaceRepository provisioning;
+    KeyspaceProvisioningService provisioning;
     @Autowired
-    RepairQueueRepository queue;
+    RepairQueueService queue;
     @Autowired
     RepairExecutionRepository execution;
+    @Autowired
+    RepairClaimService claims;
     @Autowired
     JdbcTemplate jdbc;
     @Autowired
@@ -113,7 +117,7 @@ class ControlPlaneRepositoryTest {
             + "WHERE cluster_id = 'default' AND owner_id IS NOT NULL", Integer.class);
         if (occupied != null && occupied > 0) throw new ControlPlaneExceptions.Conflict("Repair already running");
         queue.accept("default", keyspace, UUID.randomUUID().toString());
-        var operation = execution.claim(60);
+        var operation = claims.claim(60);
         execution.markDispatched(operation);
         jdbc.update("UPDATE repair_locks SET expires_at = ? WHERE owner_id = ?",
             java.sql.Timestamp.from(expiry), operation.owner());

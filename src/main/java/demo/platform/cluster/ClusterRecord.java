@@ -18,6 +18,8 @@ public record ClusterRecord(
     boolean enabled,
     long configVersion) {
 
+    public static final String DEFAULT_CLUSTER = "default";
+
     public ClusterRecord {
         if (id == null || contactPoints == null || addressMappings == null)
             throw new IllegalArgumentException("Cluster id, contact points and mappings are required");

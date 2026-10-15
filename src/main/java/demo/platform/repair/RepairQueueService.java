@@ -1,33 +1,41 @@
-package demo.platform.repair.persistence;
+package demo.platform.repair;
 
-import demo.platform.cluster.persistence.ClusterRepository;
-import demo.platform.misc.ControlPlaneExceptions;
+import demo.platform.cluster.ClusterRegistryService;
 import demo.platform.keyspace.KeyspaceNames;
-import demo.platform.repair.OperationRecord;
+import demo.platform.misc.ControlPlaneExceptions;
 import demo.platform.repair.OperationRecord.RepairDecision;
 import demo.platform.repair.OperationRecord.RepairPolicy;
-import demo.platform.repair.RepairState;
+import demo.platform.repair.persistence.OperationEntity;
+import demo.platform.repair.persistence.OperationJpaRepository;
+import demo.platform.repair.persistence.RepairLockEntity;
+import demo.platform.repair.persistence.RepairLockJpaRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.PageRequest;
-import org.springframework.stereotype.Repository;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.sql.ResultSet;
-import java.sql.SQLException;
 import java.util.List;
 import java.util.UUID;
 
-@Repository
+@Service
 @RequiredArgsConstructor
-public class RepairQueueRepository {
+public class RepairQueueService {
     private final OperationJpaRepository operations;
-    private final ClusterRepository clusters;
-    private final RepairPolicyRepository repairPolicies;
+    private final RepairLockJpaRepository locks;
+    private final ClusterRegistryService clusters;
+    private final RepairConfigurationService repairConfiguration;
 
-    static OperationRecord map(ResultSet rs) throws SQLException {
-        return new OperationRecord(UUID.fromString(rs.getString("operation_id")), rs.getString("cluster_id"),
-            rs.getString("keyspace_name"), rs.getString("owner_id"), RepairState.valueOf(rs.getString("state")),
-            rs.getString("detail"), rs.getLong("repair_policy_version"), rs.getTimestamp("updated_at").toInstant());
+    // Initialization joins cluster registration; neither side may commit on its own.
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void initializeCluster(String clusterId) {
+        locks.saveAndFlush(new RepairLockEntity(clusterId));
+    }
+
+    @Transactional(readOnly = true)
+    public boolean hasPendingWork(String clusterId) {
+        return operations.countByClusterIdAndStateIn(clusterId, List.of(
+            RepairState.QUEUED, RepairState.CLAIMED, RepairState.RUNNING, RepairState.UNKNOWN)) > 0;
     }
 
     @Transactional
@@ -38,14 +46,13 @@ public class RepairQueueRepository {
     @Transactional
     public RepairDecision accept(String clusterId, String keyspace, String requestKey, long expectedConfigVersion) {
         KeyspaceNames.validate(keyspace);
-        clusters.lockEnabled(clusterId);
+        var cluster = clusters.lockForAdmission(clusterId, -1);
         OperationRecord previous = find(clusterId, requestKey, keyspace);
         if (previous != null) return new RepairDecision(previous, false);
-        if (expectedConfigVersion >= 0 && clusters.get(clusterId).configVersion() != expectedConfigVersion)
-            throw new ControlPlaneExceptions.Conflict("Cluster configuration changed before repair acceptance; retry");
+        clusters.validateConfigurationVersion(cluster, expectedConfigVersion);
         if (operations.countByClusterIdAndState(clusterId, RepairState.QUEUED) >= 1000)
             throw new ControlPlaneExceptions.Conflict("Repair queue capacity reached");
-        RepairPolicy policy = repairPolicies.get(clusterId);
+        RepairPolicy policy = repairConfiguration.getPolicy(clusterId);
         if (policy == null) throw new IllegalStateException("Missing repair policy for cluster " + clusterId);
         UUID id = UUID.randomUUID();
         operations.saveAndFlush(new OperationEntity(id, clusterId, keyspace, requestKey,

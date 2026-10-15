@@ -1,6 +1,6 @@
 package demo.platform;
 
-import demo.platform.cluster.persistence.ClusterRepository;
+import demo.platform.cluster.ClusterRegistryService;
 import demo.platform.misc.ApiExceptionHandler;
 import demo.platform.misc.CassandraConnectionManager;
 import org.junit.jupiter.api.Test;
@@ -21,7 +21,7 @@ class PlatformApplicationTest {
     @Autowired
     private ApiExceptionHandler.CassandraProperties properties;
     @Autowired
-    private ClusterRepository clusters;
+    private ClusterRegistryService clusters;
 
     @Test
     void startsWithoutCassandra() {

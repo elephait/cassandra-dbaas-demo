@@ -1,18 +1,20 @@
 package demo.platform;
 
+import demo.platform.cluster.ClusterRegistryService;
+import demo.platform.cluster.ClusterRecord;
 import demo.platform.cluster.persistence.ClusterRepository;
 import demo.platform.misc.ApiExceptionHandler;
 import demo.platform.misc.CassandraConnectionManager;
-import demo.platform.cluster.ClusterRecord;
 import demo.platform.misc.ControlPlaneExceptions;
-import demo.platform.repair.OperationRecord;
 import demo.platform.repair.OperationRecord.RepairPolicy;
+import demo.platform.repair.OperationRecord;
+import demo.platform.repair.RepairClaimService;
 import demo.platform.repair.RepairCommandRunner;
-import demo.platform.repair.RepairWorker;
+import demo.platform.repair.RepairConfigurationService;
+import demo.platform.repair.RepairQueueService;
 import demo.platform.repair.RepairState;
+import demo.platform.repair.RepairWorker;
 import demo.platform.repair.persistence.RepairExecutionRepository;
-import demo.platform.repair.persistence.RepairPolicyRepository;
-import demo.platform.repair.persistence.RepairQueueRepository;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.data.jpa.test.autoconfigure.DataJpaTest;
@@ -27,11 +29,11 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 @DataJpaTest
-@Import({ClusterRepository.class,     RepairQueueRepository.class, RepairExecutionRepository.class})
+@Import({ClusterRepository.class, RepairQueueService.class, RepairExecutionRepository.class, RepairClaimService.class, RepairConfigurationService.class, ClusterRegistryService.class})
 class RepairSafetyTest {
     @Test
     void completesEveryNodeWithoutTreatingSecondDispatchAsAConflict() {
-        policies.save(new RepairPolicy("default",
+        repairConfiguration.savePolicy(new RepairPolicy("default",
             java.util.List.of("node1", "node2", "node3"), "noop {node} {keyspace}", 1, 0));
         java.util.List<String> commands = new java.util.ArrayList<>();
         var runner = new RepairCommandRunner() {
@@ -42,9 +44,9 @@ class RepairSafetyTest {
         };
         var properties = new ApiExceptionHandler.CassandraProperties();
         properties.getRepair().setWorkerThreads(1);
-        var service = new RepairWorker(properties, clusters, execution, policies, null, runner);
+        var service = new RepairWorker(properties, clusters, execution, claims, repairConfiguration, null, runner);
         queue.accept("default", "sequence", UUID.randomUUID().toString());
-        var operation = execution.claim(60);
+        var operation = claims.claim(60);
         try {
             service.run(operation);
             assertEquals(java.util.List.of("noop node1 sequence", "noop node2 sequence", "noop node3 sequence"), commands);
@@ -57,10 +59,10 @@ class RepairSafetyTest {
 
     @Test
     void persistsRunningExactlyOnceAndOnlyBeforeTheFirstNodeRuns() {
-        policies.save(new RepairPolicy("default",
+        repairConfiguration.savePolicy(new RepairPolicy("default",
             java.util.List.of("node1", "node2", "node3"), "noop {node} {keyspace}", 1, 0));
         queue.accept("default", "sequence", UUID.randomUUID().toString());
-        var operation = execution.claim(60);
+        var operation = claims.claim(60);
         java.util.List<String> states = new java.util.ArrayList<>();
         var runner = new RepairCommandRunner() {
             @Override
@@ -70,7 +72,7 @@ class RepairSafetyTest {
         };
         var properties = new ApiExceptionHandler.CassandraProperties();
         properties.getRepair().setWorkerThreads(1);
-        var service = new RepairWorker(properties, clusters, execution, policies, null, runner);
+        var service = new RepairWorker(properties, clusters, execution, claims, repairConfiguration, null, runner);
         try {
             service.run(operation);
             assertEquals(java.util.List.of("RUNNING", "RUNNING", "RUNNING"), states);
@@ -81,12 +83,15 @@ class RepairSafetyTest {
     }
 
     @Autowired
-    ClusterRepository clusters;    @Autowired
-    RepairQueueRepository queue;
+    ClusterRegistryService clusters;
+    @Autowired
+    RepairQueueService queue;
     @Autowired
     RepairExecutionRepository execution;
     @Autowired
-    RepairPolicyRepository policies;
+    RepairClaimService claims;
+    @Autowired
+    RepairConfigurationService repairConfiguration;
     @Autowired
     JdbcTemplate jdbc;
 
@@ -140,9 +145,9 @@ class RepairSafetyTest {
         when(connections.requireSession(any(ClusterRecord.class)))
             .thenThrow(new IllegalStateException("Cassandra unavailable before dispatch"));
         var runner = mock(RepairCommandRunner.class);
-        var service = new RepairWorker(properties, clusters, execution, policies, connections, runner);
+        var service = new RepairWorker(properties, clusters, execution, claims, repairConfiguration, connections, runner);
         queue.accept("default", "before_dispatch", UUID.randomUUID().toString());
-        var operation = execution.claim(60);
+        var operation = claims.claim(60);
         try {
             service.run(operation);
             var deferred = queue.get(operation.id());
@@ -166,7 +171,7 @@ class RepairSafetyTest {
                 throw new java.util.concurrent.TimeoutException("simulated lost CLI response");
             }
         };
-        return new RepairWorker(properties, clusters, execution, policies, null, runner);
+        return new RepairWorker(properties, clusters, execution, claims, repairConfiguration, null, runner);
     }
 
     private OperationRecord claimedRepair(String keyspace, Instant expiry) {
@@ -174,7 +179,7 @@ class RepairSafetyTest {
             + "WHERE cluster_id = 'default' AND owner_id IS NOT NULL", Integer.class);
         if (occupied != null && occupied > 0) throw new ControlPlaneExceptions.Conflict("Repair already running");
         queue.accept("default", keyspace, UUID.randomUUID().toString());
-        var operation = execution.claim(60);
+        var operation = claims.claim(60);
         execution.markDispatched(operation);
         jdbc.update("UPDATE repair_locks SET expires_at = ? WHERE owner_id = ?",
             java.sql.Timestamp.from(expiry), operation.owner());

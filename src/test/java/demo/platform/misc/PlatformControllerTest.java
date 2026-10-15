@@ -1,17 +1,14 @@
 package demo.platform.misc;
 
+import demo.platform.cluster.ClusterConfigurationService;
 import demo.platform.cluster.ClusterController;
 import demo.platform.cluster.ClusterRecord;
 import demo.platform.cluster.ClusterRecord.ContactPoint;
 import demo.platform.cluster.ClusterService;
 import demo.platform.cluster.LocalAddressTranslator;
-import demo.platform.cluster.persistence.ClusterConfigurationRepository;
-import demo.platform.cluster.persistence.ClusterRepository;
-import demo.platform.misc.AdminAccess;
-import demo.platform.misc.ApiExceptionHandler;
-import demo.platform.misc.CassandraConnectionManager;
-import demo.platform.keyspace.KeyspaceNames;
+import demo.platform.cluster.ClusterRegistryService;
 import demo.platform.keyspace.KeyspaceController;
+import demo.platform.keyspace.KeyspaceNames;
 import demo.platform.repair.OperationRecord.RepairOperation;
 import demo.platform.repair.RepairController;
 import demo.platform.repair.RepairCoordinator;
@@ -100,11 +97,11 @@ class PlatformControllerTest {
     @Test
     void reportsUnavailableWithoutCassandra() {
         var properties = properties();
-        var connections = new CassandraConnectionManager(properties, mock(ClusterConfigurationRepository.class));
-        var clusters = mock(ClusterRepository.class);
+        var connections = new CassandraConnectionManager(properties, mock(ClusterConfigurationService.class));
+        var clusters = mock(ClusterRegistryService.class);
         when(clusters.requireEnabled("default")).thenReturn(cluster("default"));
         var controller = new ClusterController(
-            new ClusterService(connections, mock(ClusterConfigurationRepository.class), clusters),
+            new ClusterService(connections, mock(ClusterConfigurationService.class), clusters),
             new AdminAccess(properties));
 
         var health = controller.health("default");

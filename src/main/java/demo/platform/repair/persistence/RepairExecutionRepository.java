@@ -1,15 +1,17 @@
 package demo.platform.repair.persistence;
 
-import demo.platform.cluster.persistence.ClusterRepository;
 import demo.platform.misc.ControlPlaneExceptions;
 import demo.platform.repair.OperationRecord;
-import demo.platform.repair.OperationRecord.RepairPolicy;
 import demo.platform.repair.RepairState;
 import lombok.RequiredArgsConstructor;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.List;
@@ -25,20 +27,10 @@ public class RepairExecutionRepository {
 
     private final JdbcTemplate jdbc;
     private final TransactionTemplate transactions;
-    private final ClusterRepository clusters;
-    private final RepairQueueRepository queue;
-    private final RepairPolicyRepository repairPolicies;
 
-    public OperationRecord claim() {
-        return transactions.execute(status -> claimSelected(null));
-    }
-
-    public OperationRecord claim(int leaseSeconds) {
-        if (leaseSeconds < 3) throw new IllegalArgumentException("Repair lease must be at least three seconds");
-        return transactions.execute(status -> claimSelected(leaseSeconds));
-    }
-
-    private OperationRecord claimSelected(Integer requestedLeaseSeconds) {
+    // The caller owns one transaction from selection through policy validation and claim.
+    @Transactional(propagation = Propagation.MANDATORY)
+    public OperationRecord selectNextQueued() {
         var eligible = jdbc.query("SELECT l.cluster_id FROM repair_locks l WHERE l.owner_id IS NULL "
                 + "AND EXISTS (SELECT 1 FROM clusters c WHERE c.cluster_id = l.cluster_id AND c.enabled = TRUE) "
                 + "AND EXISTS (SELECT 1 FROM operations o WHERE o.cluster_id = l.cluster_id AND o.state = 'QUEUED' "
@@ -54,38 +46,34 @@ public class RepairExecutionRepository {
                 + "AND EXISTS (SELECT 1 FROM repair_locks l WHERE l.cluster_id = o.cluster_id "
                 + "AND l.owner_id IS NULL) ORDER BY o.updated_at, o.operation_id "
                 + "LIMIT 1 FOR UPDATE SKIP LOCKED",
-            (rs, row) -> RepairQueueRepository.map(rs), clusterId);
+            (rs, row) -> map(rs), clusterId);
         if (queued.isEmpty()) return null;
-        OperationRecord operation = queued.getFirst();
-        var cluster = clusters.get(operation.clusterId());
-        if (cluster == null || !cluster.enabled()) return failUnclaimable(operation, "Cluster is disabled or unregistered");
-        RepairPolicy policy = repairPolicies.get(operation.clusterId());
-        if (policy == null) return failUnclaimable(operation, "Repair policy is missing for this cluster");
-        if (policy.version() != operation.repairPolicyVersion())
-            return failUnclaimable(operation, "Repair policy version " + policy.version()
-                + " replaced the accepted version " + operation.repairPolicyVersion()
-                + "; submit a new repair request");
-        int leaseSeconds = requestedLeaseSeconds == null
-            ? Math.toIntExact(policy.leaseMinutes() * 60L) : requestedLeaseSeconds;
+        return queued.getFirst();
+    }
+
+    @Transactional(propagation = Propagation.MANDATORY)
+    public OperationRecord claim(OperationRecord operation, int leaseSeconds) {
         String owner = UUID.randomUUID().toString();
+        Instant now = databaseTime();
         int locked = jdbc.update("UPDATE repair_locks SET owner_id = ?, expires_at = ? "
                 + "WHERE cluster_id = ? AND owner_id IS NULL",
-            owner, Timestamp.from(databaseTime().plusSeconds(leaseSeconds)), operation.clusterId());
+            owner, Timestamp.from(now.plusSeconds(leaseSeconds)), operation.clusterId());
         if (locked != 1) return null;
         int claimed = jdbc.update("UPDATE operations SET state = 'CLAIMED', owner_id = ?, "
-                + "updated_at = CURRENT_TIMESTAMP WHERE operation_id = ? AND state = 'QUEUED'",
-            owner, operation.id().toString());
+                + "updated_at = ? WHERE operation_id = ? AND state = 'QUEUED'",
+            owner, Timestamp.from(now), operation.id().toString());
         if (claimed != 1) throw new ControlPlaneExceptions.Conflict("Repair claim was lost");
-        return queue.get(operation.id());
+        return new OperationRecord(operation.id(), operation.clusterId(), operation.keyspace(), owner,
+            RepairState.CLAIMED, operation.detail(), operation.repairPolicyVersion(), now);
     }
 
     // Queued work that can no longer be admitted must become visible instead of occupying a slot
     // silently forever. Nothing was dispatched, so the attempt is released and reported as FAILED.
-    private OperationRecord failUnclaimable(OperationRecord operation, String reason) {
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void rejectQueued(OperationRecord operation, String reason) {
         jdbc.update("UPDATE operations SET state = 'FAILED', owner_id = NULL, detail = ?, "
                 + "updated_at = CURRENT_TIMESTAMP WHERE operation_id = ? AND state = 'QUEUED'",
             truncate(reason), operation.id().toString());
-        return null;
     }
 
     private static String truncate(String detail) {
@@ -113,13 +101,12 @@ public class RepairExecutionRepository {
         return requeueUndispatched(operation, "Undispatched attempt deferred", 0);
     }
 
-    public boolean deferUndispatched(OperationRecord operation, String reason) {
-        int attempts = queue.retryCount(operation.id());
-        int delay = Math.min(300, 5 << Math.min(attempts, 6));
-        return requeueUndispatched(operation, reason, delay);
+    public int retryCount(UUID operationId) {
+        return jdbc.queryForObject("SELECT retry_count FROM operations WHERE operation_id = ?",
+            Integer.class, operationId.toString());
     }
 
-    private boolean requeueUndispatched(OperationRecord operation, String reason, int delay) {
+    public boolean requeueUndispatched(OperationRecord operation, String reason, int delay) {
         return transactions.execute(status -> {
             lock(operation.clusterId());
             int changed = jdbc.update("UPDATE operations SET state = 'QUEUED', owner_id = NULL, "
@@ -176,11 +163,11 @@ public class RepairExecutionRepository {
 
     public void acknowledge(UUID operationId) {
         transactions.executeWithoutResult(status -> {
-            OperationRecord existing = queue.get(operationId);
+            OperationRecord existing = get(operationId);
             if (existing == null)
                 throw new ControlPlaneExceptions.Conflict("Operation is not awaiting acknowledgement");
             lock(existing.clusterId());
-            existing = queue.get(operationId);
+            existing = get(operationId);
             if (existing.state() == RepairState.ACKNOWLEDGED) return;
             if (existing.state() != RepairState.UNKNOWN || existing.owner() == null)
                 throw new ControlPlaneExceptions.Conflict("Operation is not awaiting acknowledgement");
@@ -229,6 +216,19 @@ public class RepairExecutionRepository {
     private void release(String clusterId, String owner) {
         jdbc.update("UPDATE repair_locks SET owner_id = NULL, expires_at = NULL "
             + "WHERE cluster_id = ? AND owner_id = ?", clusterId, owner);
+    }
+
+    private OperationRecord get(UUID id) {
+        var rows = jdbc.query("SELECT operation_id, cluster_id, keyspace_name, owner_id, state, detail, "
+                + "repair_policy_version, updated_at FROM operations WHERE operation_id = ?",
+            (rs, row) -> map(rs), id.toString());
+        return rows.isEmpty() ? null : rows.getFirst();
+    }
+
+    private static OperationRecord map(ResultSet rs) throws SQLException {
+        return new OperationRecord(UUID.fromString(rs.getString("operation_id")), rs.getString("cluster_id"),
+            rs.getString("keyspace_name"), rs.getString("owner_id"), RepairState.valueOf(rs.getString("state")),
+            rs.getString("detail"), rs.getLong("repair_policy_version"), rs.getTimestamp("updated_at").toInstant());
     }
 
     private Instant databaseTime() {

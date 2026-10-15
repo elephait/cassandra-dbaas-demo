@@ -1,13 +1,15 @@
 package demo.platform;
 
+import demo.platform.cluster.ClusterRegistryService;
 import demo.platform.cluster.persistence.ClusterRepository;
 import demo.platform.misc.ControlPlaneExceptions;
-import demo.platform.repair.OperationRecord;
 import demo.platform.repair.OperationRecord.RepairDecision;
+import demo.platform.repair.OperationRecord;
+import demo.platform.repair.RepairClaimService;
+import demo.platform.repair.RepairConfigurationService;
+import demo.platform.repair.RepairQueueService;
 import demo.platform.repair.RepairState;
 import demo.platform.repair.persistence.RepairExecutionRepository;
-import demo.platform.repair.persistence.RepairPolicyRepository;
-import demo.platform.repair.persistence.RepairQueueRepository;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.data.jpa.test.autoconfigure.DataJpaTest;
@@ -24,12 +26,14 @@ import java.util.concurrent.TimeUnit;
 import static org.junit.jupiter.api.Assertions.*;
 
 @DataJpaTest
-@Import({ClusterRepository.class,     RepairQueueRepository.class, RepairExecutionRepository.class})
+@Import({ClusterRepository.class, RepairQueueService.class, RepairExecutionRepository.class, RepairClaimService.class, RepairConfigurationService.class, ClusterRegistryService.class})
 class RepairIdempotencyTest {
     @Autowired
-    RepairQueueRepository queue;
+    RepairQueueService queue;
     @Autowired
     RepairExecutionRepository execution;
+    @Autowired
+    RepairClaimService claims;
 
     private static OperationRecord terminal(OperationRecord operation) {
         return new OperationRecord(operation.id(), operation.clusterId(), operation.keyspace(), operation.owner(),
@@ -45,7 +49,7 @@ class RepairIdempotencyTest {
         assertEquals(first.operation().id(), repeated.operation().id());
         assertThrows(ControlPlaneExceptions.Conflict.class,
             () -> queue.accept("default", "other", "repair-test"));
-        var operation = execution.claim(60);
+        var operation = claims.claim(60);
         execution.finish(terminal(operation));
         var after = queue.accept("default", "team", "repair-test");
         assertFalse(after.created());
@@ -71,7 +75,7 @@ class RepairIdempotencyTest {
             var second = b.get(10, TimeUnit.SECONDS);
             assertEquals(first.operation().id(), second.operation().id());
             assertNotEquals(first.created(), second.created());
-            execution.finish(terminal(execution.claim(60)));
+            execution.finish(terminal(claims.claim(60)));
         } finally {
             pool.shutdownNow();
         }

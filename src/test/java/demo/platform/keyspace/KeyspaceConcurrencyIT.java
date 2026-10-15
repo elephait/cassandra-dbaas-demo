@@ -1,10 +1,9 @@
 package demo.platform.keyspace;
 
 import demo.platform.PlatformApplication;
-import demo.platform.cluster.persistence.ClusterRepository;
+import demo.platform.cluster.ClusterRegistryService;
 import demo.platform.keyspace.persistence.KeyspaceId;
 import demo.platform.keyspace.persistence.KeyspaceJpaRepository;
-import demo.platform.keyspace.persistence.KeyspaceRepository;
 import demo.platform.misc.CassandraConnectionManager;
 import demo.platform.misc.ControlPlaneExceptions;
 import org.junit.jupiter.api.Test;
@@ -18,9 +17,9 @@ import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.testcontainers.cassandra.CassandraContainer;
-import org.testcontainers.postgresql.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
+import org.testcontainers.postgresql.PostgreSQLContainer;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 
@@ -103,7 +102,7 @@ class KeyspaceConcurrencyIT {
              var client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build()) {
             int otherPort = second.getEnvironment().getRequiredProperty("local.server.port", Integer.class);
             assertNotEquals(port, otherPort);
-            assertNotSame(first.getBean(KeyspaceRepository.class), second.getBean(KeyspaceRepository.class));
+            assertNotSame(first.getBean(KeyspaceProvisioningService.class), second.getBean(KeyspaceProvisioningService.class));
             awaitConnected(first);
             awaitConnected(second);
             var rejected = client.send(HttpRequest.newBuilder(url(port, "unauthorized"))
@@ -120,7 +119,7 @@ class KeyspaceConcurrencyIT {
 
             // Reserve a second identity on the instance that will stop, without running a heartbeat.
             String recovery = name("recovery");
-            var oldOwner = second.getBean(KeyspaceRepository.class).begin("default", recovery, QUOTA, 60);
+            var oldOwner = second.getBean(KeyspaceProvisioningService.class).begin("default", recovery, QUOTA, 60);
 
             // Three new identities compete for two remaining slots, over the HTTP API.
             var names = List.of(name("quota_a"), name("quota_b"), name("quota_c"));
@@ -151,7 +150,7 @@ class KeyspaceConcurrencyIT {
             });
             second.close();
             awaitReady(client, port, recovery);
-            var survivor = first.getBean(KeyspaceRepository.class);
+            var survivor = first.getBean(KeyspaceProvisioningService.class);
             assertFalse(survivor.renew("default", recovery, oldOwner.owner(), 60));
             assertThrows(ControlPlaneExceptions.Conflict.class,
                 () -> survivor.complete("default", recovery, oldOwner.owner()));
@@ -204,7 +203,7 @@ class KeyspaceConcurrencyIT {
 
     private static void awaitConnected(ConfigurableApplicationContext context) throws Exception {
         await(Duration.ofSeconds(120), () -> {
-            var cluster = context.getBean(ClusterRepository.class).requireEnabled("default");
+            var cluster = context.getBean(ClusterRegistryService.class).requireEnabled("default");
             return context.getBean(CassandraConnectionManager.class).currentSession(cluster)
                 .map(session -> session.getMetadata().getNodes().values().stream()
                     .anyMatch(node -> node.getState().name().equals("UP")) && session.checkSchemaAgreement())

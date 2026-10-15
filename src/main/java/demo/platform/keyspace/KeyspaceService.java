@@ -4,11 +4,10 @@ import com.datastax.oss.driver.api.core.CqlSession;
 import com.datastax.oss.driver.api.core.DefaultConsistencyLevel;
 import com.datastax.oss.driver.api.core.cql.SimpleStatement;
 import demo.platform.cluster.ClusterRecord;
-import demo.platform.cluster.persistence.ClusterRepository;
+import demo.platform.cluster.ClusterRegistryService;
+import demo.platform.keyspace.KeyspaceRecord.ProvisionDecision;
 import demo.platform.misc.CassandraConnectionManager;
 import demo.platform.misc.ControlPlaneExceptions;
-import demo.platform.keyspace.KeyspaceRecord.ProvisionDecision;
-import demo.platform.keyspace.persistence.KeyspaceRepository;
 import jakarta.annotation.PreDestroy;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -30,8 +29,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 @Slf4j
 public class KeyspaceService {
     private final CassandraConnectionManager connections;
-    private final ClusterRepository clusters;
-    private final KeyspaceRepository provisioning;
+    private final ClusterRegistryService clusters;
+    private final KeyspaceProvisioningService provisioning;
     private final ScheduledExecutorService leaseWorker = Executors.newScheduledThreadPool(2);
 
     public Map<String, Object> provision(String clusterId, String keyspace) {

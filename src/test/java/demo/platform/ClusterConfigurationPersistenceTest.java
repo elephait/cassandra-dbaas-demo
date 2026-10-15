@@ -1,30 +1,36 @@
 package demo.platform;
 
+import demo.platform.cluster.ClusterRegistryService;
+import demo.platform.repair.RepairConfigurationService;
+import demo.platform.cluster.ClusterConfigurationService;
 import demo.platform.cluster.ClusterRecord;
 import demo.platform.cluster.ClusterRecord.ClusterConfiguration;
 import demo.platform.cluster.ClusterRecord.ContactPoint;
-import demo.platform.cluster.persistence.ClusterConfigurationRepository;
 import demo.platform.cluster.persistence.ClusterRepository;
+import demo.platform.keyspace.KeyspaceProvisioningService;
 import demo.platform.misc.ControlPlaneExceptions;
-import demo.platform.keyspace.persistence.KeyspaceRepository;
 import demo.platform.repair.OperationRecord.RepairPolicy;
+import demo.platform.repair.RepairQueueService;
 import demo.platform.repair.persistence.RepairExecutionRepository;
-import demo.platform.repair.persistence.RepairPolicyRepository;
-import demo.platform.repair.persistence.RepairQueueRepository;
+import demo.platform.repair.persistence.RepairLockJpaRepository;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.data.jpa.test.autoconfigure.DataJpaTest;
 import org.springframework.context.annotation.Import;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @DataJpaTest(showSql = false)
-@Import({ClusterRepository.class, ClusterConfigurationRepository.class,     KeyspaceRepository.class, RepairQueueRepository.class, RepairExecutionRepository.class})
+@Import({ClusterRepository.class, ClusterConfigurationService.class, KeyspaceProvisioningService.class, RepairQueueService.class, RepairExecutionRepository.class, RepairConfigurationService.class, ClusterRegistryService.class})
 class ClusterConfigurationPersistenceTest {
     @Test
     void repeatingIdenticalConfigurationDoesNotChangeVersions() {
@@ -35,13 +41,17 @@ class ClusterConfigurationPersistenceTest {
     }
 
     @Autowired
-    ClusterConfigurationRepository configurations;
+    ClusterConfigurationService configurations;
     @Autowired
     ClusterRepository clusters;
     @Autowired
-    KeyspaceRepository provisioning;
+    ClusterRegistryService registry;
     @Autowired
-    RepairQueueRepository queue;
+    KeyspaceProvisioningService provisioning;
+    @Autowired
+    RepairQueueService queue;
+    @Autowired
+    RepairLockJpaRepository repairLocks;
 
     private ClusterConfiguration configuration(String id, int rf, List<String> nodes) {
         var clusterId = id;
@@ -65,7 +75,7 @@ class ClusterConfigurationPersistenceTest {
     void domainReadsWorkOutsideOpenSessionInViewAndMixedJpaJdbcCommitTogether() {
         configurations.save(configuration("domain_reads", 3, List.of("node1")));
         assertEquals("localhost", clusters.get("domain_reads").contactPoints().getFirst().host());
-        assertEquals(3, clusters.requireEnabled("domain_reads").replicationFactor());
+        assertEquals(3, registry.requireEnabled("domain_reads").replicationFactor());
         var ownership = provisioning.begin("domain_reads", "database", 5, 60);
         assertThrows(ControlPlaneExceptions.Conflict.class,
             () -> configurations.save(configuration("domain_reads", 1, List.of("node2"))));
@@ -75,5 +85,48 @@ class ClusterConfigurationPersistenceTest {
         assertEquals(1, clusters.get("domain_reads").replicationFactor());
         var accepted = queue.accept("domain_reads", "database", "domain-key");
         assertEquals("domain_reads", accepted.operation().clusterId());
+    }
+
+    @Test
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
+    void policyWriteFailureRollsBackClusterAndInitialLock() {
+        String id = "atomic_registration";
+        var invalid = new ClusterConfiguration(configuration(id, 3, List.of("node1")).cluster(),
+            new RepairPolicy(id, List.of("node1"), "x".repeat(4001) + " {keyspace}", 1, 0));
+
+        assertThrows(DataIntegrityViolationException.class, () -> configurations.save(invalid));
+
+        assertNull(clusters.get(id));
+        assertFalse(repairLocks.existsById(id));
+    }
+
+    @Test
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
+    void queuedRepairBlocksConfigurationAndPolicyChangesTogether() {
+        String id = "pending_repair";
+        var initial = configurations.save(configuration(id, 3, List.of("node1")));
+        queue.accept(id, "database", "pending-operation");
+
+        assertThrows(ControlPlaneExceptions.Conflict.class,
+            () -> configurations.save(configuration(id, 1, List.of("node2"))));
+
+        assertEquals(initial, configurations.get(id));
+    }
+
+    @Test
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
+    void staleAdmissionCannotReserveKeyspaceOrEnqueueRepair() {
+        String id = "stale_admission";
+        var initial = configurations.save(configuration(id, 3, List.of("node1")));
+        configurations.save(configuration(id, 1, List.of("node2")));
+        long oldVersion = initial.cluster().configVersion();
+
+        assertThrows(ControlPlaneExceptions.Conflict.class,
+            () -> provisioning.begin(id, "database", 5, 60, oldVersion));
+        assertThrows(ControlPlaneExceptions.Conflict.class,
+            () -> queue.accept(id, "database", "stale-request", oldVersion));
+
+        assertTrue(provisioning.list(id, 10).isEmpty());
+        assertTrue(queue.list(id, false, 10).isEmpty());
     }
 }

@@ -9,21 +9,20 @@ safely across application replicas. Its main feature is operational guardrails a
 flowchart LR
     DB[(DB and work queue)]
     DB <-->|Configuration, operations and leases| Replica
-    Operator --> API
+    Operator --> Api
     subgraph Replica[Each application replica]
         direction LR
         subgraph Requests[Request handling]
             direction TB
-            API[REST API]
-            API --> Services[Cluster and keyspace services]
-            API --> Admission[Repair admission]
+            Api[REST API]
+            Api --> Services[Cluster and keyspace services]
+            Api --> Admission[Repair admission]
         end
         Services --> Sessions[Versioned Cassandra sessions]
         Worker[Repair worker] --> Sessions
-        Worker --> Runner[Maintenance command runner]
     end
     Sessions --> Cassandra[(Cassandra data plane)]
-    Runner -->|nodetool repair| Cassandra
+    Worker -->|nodetool repair| Cassandra
 ```
 
 PostgreSQL is the authority for configuration, provisioning ownership, repair receipts and leases. Cassandra stores
@@ -37,8 +36,10 @@ The local demo uses H2 for one application process; multiple replicas require sh
 | Repair                | Persists an approved request, returns an operation ID, and runs node repairs sequentially in a background worker.                                  |
 | Health and probing    | Reports driver-observed availability; a `LOCAL_QUORUM` write/read probe demonstrates actual request availability.                                  |
 
-JPA handles ordinary persistence. Explicit SQL handles repair claims and ownership transitions where row locks and
-affected-row checks are part of correctness. Transactions stay short; remote Cassandra calls run outside them.
+Services coordinate configuration, provisioning admission and repair workflows within short database transactions.
+Cross-domain coordination stays in services; repositories focus on their own persistence. JPA handles ordinary
+persistence. Explicit SQL handles repair claims and ownership transitions where row locks and affected-row checks
+are part of correctness. Remote Cassandra calls run outside database transactions.
 
 ### Concurrency and recovery
 
@@ -51,17 +52,44 @@ affected-row checks are part of correctness. Transactions stay short; remote Cas
   work or an active provisioning lease is pending.
 - **Backpressure:** bounded worker/connection pools, a cap of 1,000 queued repairs per cluster and persisted retry
   backoff contain outages.
+- **Worker placement:** ideally, deploy repair workers as independent, autoscaled instances sharing the durable queue,
+  so maintenance capacity can scale separately from API traffic. API instances can set `DBAAS_REPAIR_WORKER_ENABLED=false`;
+  worker instances keep execution enabled. Per-cluster exclusion still applies regardless of worker count.
 
-Repair progresses through `QUEUED → CLAIMED → RUNNING → SUCCEEDED`. An incompatible queued policy snapshot is closed
-as `FAILED`. `RUNNING` is recorded before the first remote command.
+### Repair state machine
 
-| Interruption             | Recovery                                                                                              |
-|--------------------------|-------------------------------------------------------------------------------------------------------|
-| Before dispatch          | Safe retry; an expired CLAIMED operation returns to QUEUED.                                           |
-| After possible dispatch  | UNKNOWN retains cluster exclusion; no automatic replay.                                               |
-| Uncertain repair         | Stop/fence the old worker, inspect remote activity, then explicitly acknowledge the operation.        |
-| Interrupted provisioning | Ownership is released or expires; a caller retry repeats safe DDL and validates the resulting schema. |
+```mermaid
+stateDiagram-v2
+    [*] --> QUEUED: Approved request persisted
+    QUEUED --> CLAIMED: Worker claims ownership and lease
+    QUEUED --> FAILED: Accepted policy is no longer valid
+    CLAIMED --> QUEUED: Safe deferral or expired undispatched lease
+    CLAIMED --> RUNNING: Dispatch boundary persisted
+    CLAIMED --> UNKNOWN: Ownership or outcome cannot be confirmed
+    RUNNING --> SUCCEEDED: All configured node repairs complete
+    RUNNING --> UNKNOWN: Failure, timeout or expired lease
+    UNKNOWN --> ACKNOWLEDGED: Operator verifies remote activity
+    SUCCEEDED --> [*]
+    FAILED --> [*]
+    ACKNOWLEDGED --> [*]
+```
 
+| State | Meaning and next action |
+|---|---|
+| QUEUED | Durable request waiting for a worker. |
+| CLAIMED | A worker owns the lease; remote dispatch has not been recorded. Safe undispatched work can be requeued. |
+| RUNNING | Dispatch may have begun; the worker renews ownership while executing the configured node repairs. |
+| SUCCEEDED | All configured repair commands completed successfully; cluster exclusion is released. |
+| FAILED | A confirmed rejection/failure, such as an invalid queued policy; no uncertain remote work is automatically retried. |
+| UNKNOWN | The remote outcome is uncertain. Cluster exclusion remains, even after lease expiry; operator reconciliation is required. |
+| ACKNOWLEDGED | The operator verified remote activity and released exclusion; this does not assert repair success. |
+
+A command failure or timeout after possible dispatch becomes UNKNOWN, not FAILED. Acknowledgement uses
+`POST /operations/{id}/acknowledge` with `{"cassandraActivityVerified":true}` after the old worker is stopped/fenced and
+remote activity has been inspected. Any subsequent repair is a new request with a new idempotency key.
+
+Provisioning is a separate synchronous workflow: ownership is released or expires after interruption, and a caller
+retry repeats safe DDL and validates the resulting schema.
 SQL ownership cannot stop a command already running in Cassandra or atomically fence its dispatch.
 **There is no exactly-once remote execution guarantee.** Completion and lease release commit together; uncertainty
 requires reconciliation. Acknowledgement releases exclusion, but does not prove repair succeeded.
@@ -132,6 +160,8 @@ reconciliation, operation retention/metrics and production access control.
 
 Horizontal scaling increases capacity across independent clusters, but every replica currently connects to every
 enabled cluster. Larger deployments may require assigning clusters to specific replicas to limit connection and memory costs.
+Splitting API and worker tiers (`DBAAS_REPAIR_WORKER_ENABLED`) raises repair throughput without slowing request handling,
+but each worker still connects to every enabled cluster, so session assignment remains the prerequisite for fleet scale.
 
 The local tests verify functional correctness and coordination. Fleet-scale performance should be evaluated separately
 in a representative environment, measuring throughput, latency and resource usage under both peak and sustained workloads.

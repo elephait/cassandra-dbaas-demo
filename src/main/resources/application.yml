@@ -42,6 +42,7 @@ demo:
     command: ${DBAAS_REPAIR_COMMAND:docker compose exec -T {node} nodetool repair -pr {keyspace}}
     lease-minutes: ${DBAAS_REPAIR_LEASE_MINUTES:60}
     worker-threads: ${DBAAS_REPAIR_WORKER_THREADS:8}
+    worker-enabled: ${DBAAS_REPAIR_WORKER_ENABLED:true}
   provisioning-lease-seconds: ${DBAAS_PROVISIONING_LEASE_SECONDS:60}
   max-keyspaces: ${DBAAS_MAX_KEYSPACES:5}
   admin-token: ${DBAAS_ADMIN_TOKEN:local-demo-only}

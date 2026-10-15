@@ -88,6 +88,9 @@ public class ApiExceptionHandler {
             private String command;
             private int leaseMinutes = 60;
             private int workerThreads = 8;
+            // Off lets an instance serve API traffic only, so repair execution can run as its own
+            // auto-scaled tier. Coordination stays in SQL, so adding or losing workers is safe.
+            private boolean workerEnabled = true;
         }
     }
 }

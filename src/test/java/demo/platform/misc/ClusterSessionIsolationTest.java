@@ -3,13 +3,11 @@ package demo.platform.misc;
 import com.datastax.oss.driver.api.core.CqlSession;
 import com.datastax.oss.driver.api.core.config.DriverConfigLoader;
 import com.datastax.oss.driver.api.core.context.DriverContext;
+import demo.platform.cluster.ClusterConfigurationService;
 import demo.platform.cluster.ClusterRecord;
 import demo.platform.cluster.ClusterRecord.ClusterConfiguration;
 import demo.platform.cluster.ClusterRecord.ContactPoint;
 import demo.platform.cluster.LocalAddressTranslator;
-import demo.platform.cluster.persistence.ClusterConfigurationRepository;
-import demo.platform.misc.ApiExceptionHandler;
-import demo.platform.misc.CassandraConnectionManager;
 import demo.platform.repair.OperationRecord.RepairPolicy;
 import org.junit.jupiter.api.Test;
 
@@ -45,7 +43,7 @@ class ClusterSessionIsolationTest {
 
     @Test
     void connectingSessionCannotBePublishedAfterShutdown() throws Exception {
-        var registry = mock(ClusterConfigurationRepository.class);
+        var registry = mock(ClusterConfigurationService.class);
         var cluster = new ClusterRecord("east", List.of(new ContactPoint("localhost", 9042)),
             "dc1", 3, 3, List.of(), 10, 60, 5, 60, true, 1);
         var configuration = new ClusterConfiguration(cluster, new RepairPolicy(cluster.id(), List.of("node1"), "noop {keyspace}", 1, 1));
