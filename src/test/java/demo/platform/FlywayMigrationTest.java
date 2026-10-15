@@ -48,4 +48,21 @@ class FlywayMigrationTest {
             }
         }
     }
+
+    @Test
+    void policyWithoutNodeRowsMigratesToAnEmptyNonNullList() throws Exception {
+        String url = "jdbc:h2:mem:empty-policy-upgrade;DB_CLOSE_DELAY=-1";
+        Flyway.configure().dataSource(url, "sa", "").target("2").load().migrate();
+        try (var connection = DriverManager.getConnection(url, "sa", "");
+             var statement = connection.createStatement()) {
+            statement.executeUpdate("DELETE FROM repair_policy_nodes WHERE cluster_id = 'default'");
+        }
+        Flyway.configure().dataSource(url, "sa", "").load().migrate();
+        try (var connection = DriverManager.getConnection(url, "sa", "");
+             var statement = connection.createStatement();
+             var rows = statement.executeQuery("SELECT node_names FROM repair_policies WHERE cluster_id = 'default'")) {
+            assertTrue(rows.next());
+            assertEquals("", rows.getString(1));
+        }
+    }
 }

@@ -1,7 +1,8 @@
 # Cassandra control-plane POC
 
 A DBaaS control-plane prototype for registering Cassandra clusters, provisioning keyspaces and coordinating repair
-safely across application replicas. Its main feature is operational guardrails around `nodetool repair`.
+across application replicas. Repair uses Cassandra's asynchronous JMX management API, with persisted
+node progress and explicit handling of uncertain remote outcomes.
 
 ## Architecture
 
@@ -22,7 +23,7 @@ flowchart LR
         Worker[Repair worker] --> Sessions
     end
     Sessions --> Cassandra[(Cassandra data plane)]
-    Worker -->|nodetool repair| Cassandra
+    Worker -->|JMX submit and poll| Cassandra
 ```
 
 PostgreSQL is the authority for configuration, provisioning ownership, repair receipts and leases. Cassandra stores
@@ -33,7 +34,7 @@ The local demo uses H2 for one application process; multiple replicas require sh
 |-----------------------|----------------------------------------------------------------------------------------------------------------------------------------------------|
 | Cluster registration  | Stores connection settings and versioned repair policies; reconnects sessions when configuration changes.                                          |
 | Keyspace provisioning | Synchronously creates or revalidates the keyspace and probe table. `(clusterId, keyspace)` is its identity; retries converge on the same resource. |
-| Repair                | Persists an approved request, returns an operation ID, and runs node repairs sequentially in a background worker.                                  |
+| Repair                | Persists an approved request and node plan; workers submit and poll one node at a time through JMX, releasing their slot between observations. |
 | Health and probing    | Reports driver-observed availability; a `LOCAL_QUORUM` write/read probe demonstrates actual request availability.                                  |
 
 Services coordinate configuration, provisioning admission and repair workflows within short database transactions.
@@ -69,10 +70,10 @@ stateDiagram-v2
     QUEUED --> CLAIMED: Worker claims ownership and lease
     QUEUED --> FAILED: Accepted policy is no longer valid
     CLAIMED --> QUEUED: Safe deferral or expired undispatched lease
-    CLAIMED --> RUNNING: Dispatch boundary persisted
+    CLAIMED --> RUNNING: JMX node plan persisted
     CLAIMED --> UNKNOWN: Ownership or outcome cannot be confirmed
     RUNNING --> SUCCEEDED: All configured node repairs complete
-    RUNNING --> UNKNOWN: Failure, timeout or expired lease
+    RUNNING --> UNKNOWN: Ambiguous submission, failure or lost remote identity
     UNKNOWN --> ACKNOWLEDGED: Operator verifies remote activity
     SUCCEEDED --> [*]
     FAILED --> [*]
@@ -83,13 +84,15 @@ stateDiagram-v2
 |--------------|---------------------------------------------------------------------------------------------------------------------------|
 | QUEUED       | Durable request waiting for a worker.                                                                                     |
 | CLAIMED      | A worker owns the lease; remote dispatch has not been recorded. Safe undispatched work can be requeued.                   |
-| RUNNING      | Dispatch may have begun; the worker renews ownership while executing the configured node repairs.                         |
+| RUNNING      | Durable JMX node plan is active. Cluster reservation persists; workers hold short claims only while submitting/polling. |
 | SUCCEEDED    | All configured repair commands completed successfully; cluster exclusion is released.                                     |
 | FAILED       | A confirmed rejection/failure, such as an invalid queued policy; no uncertain remote work is automatically retried.       |
 | UNKNOWN      | The remote outcome is uncertain. Cluster exclusion remains, even after lease expiry; operator reconciliation is required. |
 | ACKNOWLEDGED | The operator verified remote activity and released exclusion; this does not assert repair success.                        |
 
-A command failure or timeout after possible dispatch becomes UNKNOWN, not FAILED. Acknowledgement uses
+A JMX submission with an uncertain response becomes UNKNOWN, not FAILED. Missing status or transient
+observation errors are polled again until the observation deadline; an unsupported status or changed JVM
+identity becomes UNKNOWN immediately. Acknowledgement uses
 `POST /operations/{id}/acknowledge` with `{"cassandraActivityVerified":true}` after the old worker is stopped/fenced and
 remote activity has been inspected. Any subsequent repair is a new request with a new idempotency key.
 
@@ -112,9 +115,18 @@ $env:SPRING_PROFILES_ACTIVE = 'local'
 ```
 
 The application starts at `http://localhost:8088`. Wait until cluster health reports `HEALTHY`.
-The local cluster has three nodes with replication factor 3. Background polling defaults to 20 seconds; set
-`DBAAS_POLL_INTERVAL_SECONDS` before starting the application to change it. Startup checks run immediately, and lease
-heartbeats keep their independent timing. A queued repair may wait up to one polling interval before starting.
+The local cluster has three nodes with replication factor 3. Connection polling defaults to 20 seconds;
+set `DBAAS_POLL_INTERVAL_SECONDS` before starting the application to change it.
+
+**Repair prerequisite:** `DBAAS_REPAIR_TRANSPORT` defaults to `jmx`, but the standard `compose.yml`
+does not expose remote JMX or provide node host-ID mappings. The commands above support registration,
+provisioning and probes; the repair request below requires reachable JMX endpoints configured under
+`demo.repair.jmx.targets.default` for all three nodes. See
+[JMX endpoint configuration](JMX-REPAIR-REVIEW.md#required-deployment-configuration).
+Without those mappings, repair is rejected at admission. To verify native JMX repair independently
+using an isolated, automatically configured two-node fixture, run `./verify-jmx.ps1`.
+JMX workers check for due work every second; remote status observations default to 20 seconds
+(`demo.repair.jmx.poll-seconds`).
 
 In another terminal, run this end-to-end example:
 
@@ -143,7 +155,8 @@ do {
 } while ($status.state -in @('QUEUED','CLAIMED','RUNNING'))
 ```
 
-Expected repair result: `SUCCEEDED All configured repairs completed`. Use your configured admin token if it
+With the JMX prerequisites configured, the expected repair result is `SUCCEEDED All JMX node repairs completed`.
+Inspect `GET /operations/{id}/nodes` with the admin header for per-node progress. Use your configured admin token if it
 differs. To retry a lost repair response, resend the request with the same idempotency key; create a new key only for a
 new repair.
 
@@ -151,7 +164,21 @@ Stop the application with Ctrl+C. `docker compose down` stops Cassandra and pres
 
 ## Verify the design
 
-For a live three-node recovery demonstration, keep the local application running and use:
+```powershell
+# Unit/persistence tests only; this excludes *IT integration tests:
+mvn -o -B '-Dmaven.repo.local=.m2' test
+# Unit tests plus live Cassandra 5.0.5 and PostgreSQL upgrade tests; starts/stops its fixture:
+./verify-jmx.ps1
+```
+
+The script enables Failsafe with `-Pintegration`, explicitly selects `JmxCassandraIT` and
+`RepairPolicyMigrationIT`, and enables the live test with `-Djmx.live=true`. It fails if either
+integration test is absent or skipped. Failsafe reports are under `target/failsafe-reports`;
+reviewable result counts and real server observations are retained under `verification/jmx`.
+The offline commands assume `.m2` is populated; omit `-o` on a first build if dependencies are missing.
+
+For a live three-node recovery demonstration, first configure the main application's three JMX
+endpoints as described above, keep the local application running, and use:
 
 ```powershell
 ./verify-recovery.ps1

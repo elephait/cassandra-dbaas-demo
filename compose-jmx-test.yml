@@ -1,0 +1,31 @@
+name: cassandra-jmx-review
+x-test-node: &test-node
+  image: cassandra:5.0.5
+  mem_limit: 1536m
+  healthcheck:
+    test: [CMD-SHELL, "cqlsh -e 'SELECT release_version FROM system.local' >/dev/null"]
+    interval: 10s
+    timeout: 10s
+    retries: 60
+    start_period: 90s
+  environment: &test-env
+    CASSANDRA_CLUSTER_NAME: jmx-review
+    CASSANDRA_DC: dc1
+    CASSANDRA_ENDPOINT_SNITCH: GossipingPropertyFileSnitch
+    CASSANDRA_SEEDS: node1
+    MAX_HEAP_SIZE: 512M
+    LOCAL_JMX: "no"
+services:
+  node1:
+    <<: *test-node
+    ports: ["127.0.0.1:19042:9042", "127.0.0.1:17198:7199", "127.0.0.1:17199:17199"]
+    environment:
+      <<: *test-env
+      JVM_EXTRA_OPTS: -Djava.rmi.server.hostname=127.0.0.1 -Dcom.sun.management.jmxremote.rmi.port=17199 -Dcom.sun.management.jmxremote.authenticate=false
+  node2:
+    <<: *test-node
+    ports: ["127.0.0.1:19043:9042", "127.0.0.1:17298:7199", "127.0.0.1:17299:17299"]
+    environment:
+      <<: *test-env
+      JVM_EXTRA_OPTS: -Djava.rmi.server.hostname=127.0.0.1 -Dcom.sun.management.jmxremote.rmi.port=17299 -Dcom.sun.management.jmxremote.authenticate=false
+    depends_on: [node1]
