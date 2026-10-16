@@ -1,7 +1,8 @@
 package demo.platform.repair.persistence;
 
-import jakarta.persistence.*;
 import demo.platform.repair.RepairState;
+import jakarta.persistence.*;
+import lombok.AccessLevel;
 import lombok.NoArgsConstructor;
 import org.hibernate.annotations.JdbcTypeCode;
 import org.hibernate.type.SqlTypes;
@@ -11,7 +12,8 @@ import java.util.UUID;
 
 @Entity
 @Table(name = "operations")
-@NoArgsConstructor(access = lombok.AccessLevel.PROTECTED)
+// Inserted through JPA; later state transitions are fenced SQL in RepairExecutionRepository.
+@NoArgsConstructor(access = AccessLevel.PROTECTED)
 public class OperationEntity {
     @Id
     @Column(name = "operation_id", length = 36)
@@ -31,23 +33,20 @@ public class OperationEntity {
     private String detail;
     @Column(name = "request_key", nullable = false, length = 128)
     private String requestKey;
-    @Column(name = "repair_policy_version", nullable = false)
-    private long repairPolicyVersion;
     @Column(name = "updated_at", nullable = false)
-    @JdbcTypeCode(SqlTypes.TIMESTAMP)
     private Instant updatedAt;
     @Column(name = "next_attempt_at", nullable = false)
-    @JdbcTypeCode(SqlTypes.TIMESTAMP)
     private Instant nextAttemptAt;
     @Column(name = "retry_count", nullable = false)
     private int retryCount;
+    @Column(name = "delayed", nullable = false)
+    private boolean delayed;
 
-    public OperationEntity(UUID id, String clusterId, String keyspace, String requestKey, long policyVersion, Instant now) {
+    public OperationEntity(UUID id, String clusterId, String keyspace, String requestKey, Instant now) {
         this.id = id;
         this.clusterId = clusterId;
         this.keyspace = keyspace;
         this.requestKey = requestKey;
-        this.repairPolicyVersion = policyVersion;
         this.state = RepairState.QUEUED;
         this.detail = "Approved repair queued";
         this.updatedAt = now;

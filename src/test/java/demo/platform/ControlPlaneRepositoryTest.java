@@ -1,14 +1,11 @@
 package demo.platform;
 
 import demo.platform.cluster.ClusterRegistryService;
-import demo.platform.cluster.persistence.ClusterRepository;
 import demo.platform.keyspace.KeyspaceProvisioningService;
-import demo.platform.misc.ControlPlaneExceptions;
-import demo.platform.repair.OperationRecord;
-import demo.platform.repair.RepairClaimService;
-import demo.platform.repair.RepairConfigurationService;
-import demo.platform.repair.RepairQueueService;
-import demo.platform.repair.RepairState;
+import demo.platform.common.ControlPlaneExceptions;
+import demo.platform.common.DatabaseClock;
+import demo.platform.repair.*;
+import demo.platform.repair.jmx.JmxRepairProperties;
 import demo.platform.repair.persistence.RepairExecutionRepository;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -22,21 +19,9 @@ import java.util.UUID;
 import static org.junit.jupiter.api.Assertions.*;
 
 @DataJpaTest(properties = "spring.datasource.url=jdbc:h2:mem:control-plane-test;DB_CLOSE_DELAY=-1")
-@Import({ClusterRepository.class, KeyspaceProvisioningService.class, RepairQueueService.class, RepairExecutionRepository.class, RepairClaimService.class, RepairConfigurationService.class, ClusterRegistryService.class})
+@Import({KeyspaceProvisioningService.class, RepairQueueService.class, RepairExecutionRepository.class, RepairClaimService.class, ClusterRegistryService.class,
+    DatabaseClock.class, JmxRepairProperties.class})
 class ControlPlaneRepositoryTest {
-    @Test
-    void expiredProvisioningOwnerCannotPublishReady() {
-        var first = provisioning.begin("default", "expired", 5, 60);
-        jdbc.update("UPDATE keyspaces SET expires_at = ? WHERE cluster_id = 'default' AND keyspace_name = 'expired'", java.sql.Timestamp.from(Instant.now().minusSeconds(60)));
-        entityManager.clear();
-        assertFalse(provisioning.renew("default", "expired", first.owner(), 60));
-        assertThrows(ControlPlaneExceptions.Conflict.class, () -> provisioning.complete("default", "expired", first.owner()));
-        var second = provisioning.begin("default", "expired", 5, 60);
-        assertNotEquals(first.owner(), second.owner());
-        assertThrows(ControlPlaneExceptions.Conflict.class, () -> provisioning.complete("default", "expired", first.owner()));
-        provisioning.complete("default", "expired", second.owner());
-    }
-
     @Autowired
     KeyspaceProvisioningService provisioning;
     @Autowired
@@ -50,9 +35,17 @@ class ControlPlaneRepositoryTest {
     @Autowired
     jakarta.persistence.EntityManager entityManager;
 
-    private static OperationRecord terminal(OperationRecord operation, RepairState state, String detail) {
-        return new OperationRecord(operation.id(), operation.clusterId(), operation.keyspace(), operation.owner(),
-            state, detail, operation.repairPolicyVersion(), Instant.now());
+    @Test
+    void expiredProvisioningOwnerCannotPublishReady() {
+        var first = provisioning.begin("default", "expired", 5, 60);
+        jdbc.update("UPDATE keyspaces SET expires_at = ? WHERE cluster_id = 'default' AND keyspace_name = 'expired'", java.sql.Timestamp.from(Instant.now().minusSeconds(60)));
+        entityManager.clear();
+        assertFalse(provisioning.renew("default", "expired", first.owner(), 60));
+        assertThrows(ControlPlaneExceptions.Conflict.class, () -> provisioning.complete("default", "expired", first.owner()));
+        var second = provisioning.begin("default", "expired", 5, 60);
+        assertNotEquals(first.owner(), second.owner());
+        assertThrows(ControlPlaneExceptions.Conflict.class, () -> provisioning.complete("default", "expired", first.owner()));
+        provisioning.complete("default", "expired", second.owner());
     }
 
     @Test
@@ -82,9 +75,9 @@ class ControlPlaneRepositoryTest {
     void listsKeyspacesAndActiveOperations() {
         var provision = provisioning.begin("default", "listed", 2, 60);
         provisioning.complete("default", "listed", provision.owner());
-        var completed = claimedRepair("listed", Instant.now().plusSeconds(60));
-        execution.finish(terminal(completed, RepairState.SUCCEEDED, "done"));
-        var active = claimedRepair("listed", Instant.now().plusSeconds(60));
+        startedRepair("listed");
+        RepairRuns.succeed(execution);
+        var active = startedRepair("listed");
 
         assertEquals("listed", provisioning.list("default", 10).getFirst().keyspace());
         assertEquals(active.id(), queue.list("default", true, 10).getFirst().id());
@@ -92,35 +85,28 @@ class ControlPlaneRepositoryTest {
     }
 
     @Test
-    void persistsOperationAndPreventsConcurrentRepairLease() {
-        var operation = claimedRepair("team", Instant.now().plusSeconds(60));
-        assertThrows(ControlPlaneExceptions.Conflict.class,
-            () -> claimedRepair("other", Instant.now().plusSeconds(60)));
-        execution.finish(terminal(operation, RepairState.SUCCEEDED, "done"));
+    void oneActiveRepairPerClusterAndCompletionAdmitsTheNext() {
+        var operation = startedRepair("team");
+        assertNull(startedRepair("other"), "the cluster reservation is held while a repair runs");
+        RepairRuns.succeed(execution);
         assertEquals(RepairState.SUCCEEDED, queue.get(operation.id()).state());
-        assertNotEquals(operation.id(), claimedRepair("other", Instant.now().plusSeconds(60)).id());
+        var next = RepairRuns.start(claims, execution);
+        assertNotNull(next);
+        assertNotEquals(operation.id(), next.id());
     }
 
     @Test
-    void requiresAcknowledgementAfterRepairLeaseExpires() {
-        var operation = claimedRepair("team", Instant.now().minusSeconds(1));
-        assertEquals(1, execution.reconcileExpired());
+    void uncertainOutcomeRequiresAcknowledgementBeforeTheNextRepair() {
+        var operation = startedRepair("team");
+        RepairRuns.becomeUnknown(execution, "Worker lease expired during submission");
         assertEquals(RepairState.UNKNOWN, queue.get(operation.id()).state());
-        assertThrows(ControlPlaneExceptions.Conflict.class,
-            () -> claimedRepair("other", Instant.now().plusSeconds(60)));
+        assertNull(startedRepair("other"));
         execution.acknowledge(operation.id());
-        assertNotNull(claimedRepair("other", Instant.now().plusSeconds(60)));
+        assertNotNull(RepairRuns.start(claims, execution));
     }
 
-    private OperationRecord claimedRepair(String keyspace, Instant expiry) {
-        Integer occupied = jdbc.queryForObject("SELECT COUNT(*) FROM repair_locks "
-            + "WHERE cluster_id = 'default' AND owner_id IS NOT NULL", Integer.class);
-        if (occupied != null && occupied > 0) throw new ControlPlaneExceptions.Conflict("Repair already running");
+    private OperationRecord startedRepair(String keyspace) {
         queue.accept("default", keyspace, UUID.randomUUID().toString());
-        var operation = claims.claim(60);
-        execution.markDispatched(operation);
-        jdbc.update("UPDATE repair_locks SET expires_at = ? WHERE owner_id = ?",
-            java.sql.Timestamp.from(expiry), operation.owner());
-        return queue.get(operation.id());
+        return RepairRuns.start(claims, execution);
     }
 }

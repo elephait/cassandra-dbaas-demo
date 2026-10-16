@@ -1,11 +1,13 @@
 package demo.platform.keyspace;
 
 import demo.platform.cluster.ClusterRegistryService;
+import demo.platform.cluster.PendingClusterWork;
+import demo.platform.common.ControlPlaneExceptions;
+import demo.platform.common.DatabaseClock;
 import demo.platform.keyspace.KeyspaceRecord.ProvisionDecision;
 import demo.platform.keyspace.persistence.KeyspaceEntity;
 import demo.platform.keyspace.persistence.KeyspaceId;
 import demo.platform.keyspace.persistence.KeyspaceJpaRepository;
-import demo.platform.misc.ControlPlaneExceptions;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
@@ -18,9 +20,10 @@ import java.util.UUID;
 
 @Service
 @RequiredArgsConstructor
-public class KeyspaceProvisioningService {
+public class KeyspaceProvisioningService implements PendingClusterWork {
     private final KeyspaceJpaRepository keyspaces;
     private final ClusterRegistryService clusters;
+    private final DatabaseClock clock;
 
     @Transactional(isolation = Isolation.READ_COMMITTED)
     public ProvisionDecision begin(String clusterId, String keyspace, int maxKeyspaces, int leaseSeconds) {
@@ -37,13 +40,13 @@ public class KeyspaceProvisioningService {
         clusters.lockForAdmission(clusterId, expectedConfigVersion);
         var id = new KeyspaceId(clusterId, keyspace);
         KeyspaceEntity existing = keyspaces.findById(id).orElse(null);
-        Instant now = keyspaces.databaseTime().toInstant();
+        Instant now = clock.now();
         if (existing != null) {
             if (existing.getState() == ProvisioningState.READY) return new ProvisionDecision(true, null);
             if (existing.getOwner() != null && existing.getExpiresAt() != null && existing.getExpiresAt().isAfter(now))
                 throw new ControlPlaneExceptions.Conflict("Keyspace provisioning is already in progress");
         } else {
-            if (keyspaces.countById_ClusterId(clusterId) >= maxKeyspaces)
+            if (keyspaces.countByIdClusterId(clusterId) >= maxKeyspaces)
                 throw new ControlPlaneExceptions.KeyspaceQuotaExceeded();
             existing = new KeyspaceEntity(id);
         }
@@ -56,7 +59,7 @@ public class KeyspaceProvisioningService {
     @Transactional
     public boolean renew(String clusterId, String keyspace, String owner, int seconds) {
         return keyspaces.renew(new KeyspaceId(clusterId, keyspace), owner,
-            keyspaces.databaseTime().toInstant().plusSeconds(seconds), ProvisioningState.PROVISIONING) == 1;
+            clock.now().plusSeconds(seconds), ProvisioningState.PROVISIONING) == 1;
     }
 
     @Transactional
@@ -73,17 +76,21 @@ public class KeyspaceProvisioningService {
 
     @Transactional(readOnly = true)
     public boolean owns(String clusterId, String keyspace, String owner) {
-        return keyspaces.owns(new KeyspaceId(clusterId, keyspace), owner, ProvisioningState.PROVISIONING);
+        return keyspaces.existsByIdAndOwnerAndStateAndExpiresAtAfter(new KeyspaceId(clusterId, keyspace), owner,
+            ProvisioningState.PROVISIONING, clock.now());
     }
 
+    @Override
     @Transactional(readOnly = true)
     public boolean hasPendingWork(String clusterId) {
-        return keyspaces.countProvisioningByState(clusterId, ProvisioningState.PROVISIONING) > 0;
+        // An unexpired lease implies a live owner; release and completion clear both together.
+        return keyspaces.existsByIdClusterIdAndStateAndExpiresAtAfter(clusterId, ProvisioningState.PROVISIONING,
+            clock.now());
     }
 
     @Transactional(readOnly = true)
     public List<KeyspaceRecord> list(String clusterId, int limit) {
-        return keyspaces.findById_ClusterIdOrderByUpdatedAtDescId_KeyspaceAsc(clusterId, PageRequest.of(0, limit))
+        return keyspaces.findByIdClusterIdOrderByUpdatedAtDescIdKeyspaceAsc(clusterId, PageRequest.of(0, limit))
             .stream().map(k -> new KeyspaceRecord(k.getId().getClusterId(), k.getId().getKeyspace(),
                 k.getState(), k.getUpdatedAt())).toList();
     }

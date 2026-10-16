@@ -1,14 +1,11 @@
 package demo.platform;
 
 import demo.platform.cluster.ClusterRegistryService;
-import demo.platform.cluster.persistence.ClusterRepository;
-import demo.platform.misc.ControlPlaneExceptions;
+import demo.platform.common.DatabaseClock;
+import demo.platform.common.ControlPlaneExceptions;
+import demo.platform.repair.*;
 import demo.platform.repair.OperationRecord.RepairDecision;
-import demo.platform.repair.OperationRecord;
-import demo.platform.repair.RepairClaimService;
-import demo.platform.repair.RepairConfigurationService;
-import demo.platform.repair.RepairQueueService;
-import demo.platform.repair.RepairState;
+import demo.platform.repair.jmx.JmxRepairProperties;
 import demo.platform.repair.persistence.RepairExecutionRepository;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -17,7 +14,6 @@ import org.springframework.context.annotation.Import;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.time.Instant;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
@@ -26,7 +22,8 @@ import java.util.concurrent.TimeUnit;
 import static org.junit.jupiter.api.Assertions.*;
 
 @DataJpaTest
-@Import({ClusterRepository.class, RepairQueueService.class, RepairExecutionRepository.class, RepairClaimService.class, RepairConfigurationService.class, ClusterRegistryService.class})
+@Import({RepairQueueService.class, RepairExecutionRepository.class, RepairClaimService.class, ClusterRegistryService.class,
+    DatabaseClock.class, JmxRepairProperties.class})
 class RepairIdempotencyTest {
     @Autowired
     RepairQueueService queue;
@@ -34,11 +31,6 @@ class RepairIdempotencyTest {
     RepairExecutionRepository execution;
     @Autowired
     RepairClaimService claims;
-
-    private static OperationRecord terminal(OperationRecord operation) {
-        return new OperationRecord(operation.id(), operation.clusterId(), operation.keyspace(), operation.owner(),
-            RepairState.SUCCEEDED, "done", Instant.now());
-    }
 
     @Test
     void replaysActiveAndCompletedRequestsAndRejectsConflictingReuse() {
@@ -49,8 +41,8 @@ class RepairIdempotencyTest {
         assertEquals(first.operation().id(), repeated.operation().id());
         assertThrows(ControlPlaneExceptions.Conflict.class,
             () -> queue.accept("default", "other", "repair-test"));
-        var operation = claims.claim(60);
-        execution.finish(terminal(operation));
+        var operation = RepairRuns.start(claims, execution);
+        RepairRuns.succeed(execution);
         var after = queue.accept("default", "team", "repair-test");
         assertFalse(after.created());
         assertEquals(RepairState.SUCCEEDED, after.operation().state());
@@ -75,7 +67,8 @@ class RepairIdempotencyTest {
             var second = b.get(10, TimeUnit.SECONDS);
             assertEquals(first.operation().id(), second.operation().id());
             assertNotEquals(first.created(), second.created());
-            execution.finish(terminal(claims.claim(60)));
+            RepairRuns.start(claims, execution);
+            RepairRuns.succeed(execution);
         } finally {
             pool.shutdownNow();
         }

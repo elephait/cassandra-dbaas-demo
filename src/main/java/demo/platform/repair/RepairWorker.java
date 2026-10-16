@@ -1,216 +1,93 @@
 package demo.platform.repair;
 
-import demo.platform.cluster.ClusterRecord;
-import demo.platform.cluster.ClusterRegistryService;
-import demo.platform.keyspace.SchemaValidator;
-import demo.platform.misc.ApiExceptionHandler;
-import demo.platform.misc.CassandraConnectionManager;
-import demo.platform.repair.OperationRecord.RepairPolicy;
-import demo.platform.repair.persistence.RepairExecutionRepository;
+import demo.platform.common.PlatformProperties;
 import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
-import org.springframework.stereotype.Service;
+import org.springframework.stereotype.Component;
 
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.time.Instant;
-import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
-@Service
+/**
+ * In-process repair scheduler: one poller thread claims due work from the database every second and
+ * hands each unit to a bounded worker pool. All coordination state is in the database, so any number
+ * of replicas can run workers, and a worker can stop at any point without losing work.
+ */
+@Component
 @Slf4j
-@org.springframework.boot.autoconfigure.condition.ConditionalOnProperty(name = "demo.repair.transport", havingValue = "cli")
 public class RepairWorker {
-    private final ExecutorService workers;
+    private final RepairExecutionService execution;
     private final ScheduledExecutorService poller;
-    private final ScheduledExecutorService leaseWorker;
+    private final ExecutorService workers;
     private final AtomicInteger active = new AtomicInteger();
-    private final AtomicBoolean closing = new AtomicBoolean();
-    private final boolean enabled;
-    private final int workerThreads;
-    private final int pollIntervalSeconds;
-    private final ClusterRegistryService clusters;
-    private final RepairExecutionRepository execution;
-    private final RepairClaimService claims;
-    private final RepairConfigurationService repairConfiguration;
-    private final CassandraConnectionManager connections;
-    private final RepairCommandRunner commandRunner;
+    private final int capacity;
+    private volatile boolean closing;
 
-    @Autowired
-    public RepairWorker(ApiExceptionHandler.CassandraProperties properties, ClusterRegistryService clusters,
-                         RepairExecutionRepository execution, RepairClaimService claims,
-                         RepairConfigurationService repairConfiguration, CassandraConnectionManager connections,
-                         RepairCommandRunner commandRunner) {
-        this.clusters = clusters;
+    public RepairWorker(PlatformProperties properties, RepairExecutionService execution) {
         this.execution = execution;
-        this.claims = claims;
-        this.repairConfiguration = repairConfiguration;
-        this.connections = connections;
-        this.commandRunner = commandRunner;
-        this.workerThreads = properties.getRepair().getWorkerThreads();
-        this.pollIntervalSeconds = properties.getPollIntervalSeconds();
-        if (workerThreads < 1 || workerThreads > 64)
-            throw new IllegalArgumentException("Repair worker threads must be 1..64");
-        this.enabled = properties.getRepair().isWorkerEnabled();
-        // An instance with the worker disabled must not hold executor threads at all: it serves API
-        // traffic while a separate worker tier owns dispatch. All coordination is in SQL, so adding
-        // or losing a worker instance only changes throughput, never correctness.
-        this.workers = enabled ? Executors.newFixedThreadPool(workerThreads) : null;
-        this.poller = enabled
-            ? Executors.newSingleThreadScheduledExecutor(task -> daemon(task, "repair-poller")) : null;
-        this.leaseWorker = enabled
-            ? Executors.newScheduledThreadPool(2, task -> daemon(task, "repair-lease")) : null;
+        capacity = properties.getRepair().getWorkerThreads();
+        if (capacity < 1 || capacity > 64) throw new IllegalArgumentException("Repair worker threads must be 1..64");
+        boolean enabled = properties.getRepair().isWorkerEnabled();
+        workers = enabled ? Executors.newFixedThreadPool(capacity, threads("repair-worker-")) : null;
+        poller = enabled ? Executors.newSingleThreadScheduledExecutor(threads("repair-poller-")) : null;
     }
 
-    private static Thread daemon(Runnable task, String name) {
-        Thread thread = new Thread(task, name);
-        thread.setDaemon(true);
-        return thread;
+    private static ThreadFactory threads(String prefix) {
+        AtomicInteger sequence = new AtomicInteger();
+        return task -> {
+            Thread thread = new Thread(task, prefix + sequence.incrementAndGet());
+            thread.setDaemon(true);
+            return thread;
+        };
     }
 
     @EventListener(ApplicationReadyEvent.class)
-    void startPolling() {
-        if (!enabled) {
-            log.info("Repair worker is disabled on this instance; it serves API traffic only");
-            return;
-        }
-        poller.scheduleWithFixedDelay(this::poll, 0, pollIntervalSeconds, TimeUnit.SECONDS);
+    public void start() {
+        if (poller != null) poller.scheduleWithFixedDelay(this::poll, 0, 1, TimeUnit.SECONDS);
     }
 
-    void poll() {
-        // The guard belongs here, not only in startPolling: this is the entry point for the scheduled
-        // task as well as for direct invocation.
-        if (!enabled || closing.get()) return;
+    /** Claims only while a worker slot is free, so claimed work never waits behind a full pool. */
+    public void poll() {
+        if (workers == null || closing) return;
         try {
             execution.reconcileExpired();
-            while (!closing.get() && active.get() < workerThreads) {
-                OperationRecord operation = claims.claim();
-                if (operation == null) return;
+            while (!closing && active.get() < capacity) {
+                Runnable action = execution.nextAction();
+                if (action == null) return;
                 active.incrementAndGet();
                 try {
                     workers.submit(() -> {
                         try {
-                            run(operation);
+                            action.run();
+                        } catch (RuntimeException e) {
+                            log.warn("Repair action failed; its lease will expire and the work is revisited", e);
                         } finally {
                             active.decrementAndGet();
                         }
                     });
-                } catch (RejectedExecutionException exception) {
+                } catch (RejectedExecutionException e) {
                     active.decrementAndGet();
-                    execution.requeueUndispatched(operation);
-                    return;
+                    return; // Shutting down: the unexecuted claim's short lease expires safely.
                 }
             }
-        } catch (Exception exception) {
-            log.warn("Repair queue poll failed; will retry", exception);
-        }
-    }
-
-    public void run(OperationRecord operation) {
-        AtomicBoolean lost = new AtomicBoolean();
-        ScheduledFuture<?> heartbeat = null;
-        try {
-            ClusterRecord.Settings cluster = clusters.requireEnabled(operation.clusterId());
-            RepairPolicy policy = requirePolicy(operation);
-            int leaseSeconds = Math.toIntExact(policy.leaseMinutes() * 60L);
-            int heartbeatSeconds = Math.max(1, leaseSeconds / 3);
-            // Fixed delay, not fixed rate: a slow renewal must not be chased by an immediate retry.
-            heartbeat = leaseWorker.scheduleWithFixedDelay(() -> renewLease(operation, leaseSeconds, lost),
-                heartbeatSeconds, heartbeatSeconds, TimeUnit.SECONDS);
-            Files.createDirectories(Path.of(".local", "operations"));
-            boolean dispatched = false;
-            for (String node : policy.nodes()) {
-                // Admission is re-checked before every node, but RUNNING is persisted only once,
-                // before the first remote command. Repeating that transition per node would rely on
-                // the database reporting a matched row when nothing but time has changed.
-                assertDispatchAllowed(operation, lost);
-                validateClusterForDispatch(operation, cluster);
-                if (!dispatched) {
-                    execution.markDispatched(operation);
-                    dispatched = true;
-                }
-                String command = policy.command().replace("{node}", node)
-                    .replace("{keyspace}", operation.keyspace());
-                commandRunner.execute(command,
-                    Path.of(".local", "operations", operation.id() + "-" + node + ".log"));
-            }
-            if (lost.get()) throw new IllegalStateException("Lease renewal failed during execution");
-            execution.finish(new OperationRecord(operation.id(), operation.clusterId(), operation.keyspace(),
-                operation.owner(), RepairState.SUCCEEDED, "All configured repairs completed",
-                operation.repairPolicyVersion(), Instant.now()));
-        } catch (Exception exception) {
-            recordUncertainOrRequeue(operation, exception);
-            if (exception instanceof InterruptedException) Thread.currentThread().interrupt();
-        } finally {
-            if (heartbeat != null) heartbeat.cancel(false);
-        }
-    }
-
-    private void renewLease(OperationRecord operation, int leaseSeconds, AtomicBoolean lost) {
-        try {
-            if (!execution.renew(operation.owner(), leaseSeconds)) lost.set(true);
-        } catch (Exception exception) {
-            lost.set(true);
-            log.warn("Repair lease renewal failed for {}", operation.id(), exception);
-        }
-    }
-
-    private void validateClusterForDispatch(OperationRecord operation, ClusterRecord.Settings cluster) {
-        if (connections == null) return;
-        var session = connections.requireSession(cluster);
-        long up = session.getMetadata().getNodes().values().stream()
-            .filter(node -> node.getState()
-                == com.datastax.oss.driver.api.core.metadata.NodeState.UP)
-            .filter(node -> cluster.datacenter().equals(node.getDatacenter())).count();
-        if (up != cluster.expectedNodes())
-            throw new IllegalStateException("All expected nodes must be UP before dispatch");
-        SchemaValidator.validate(session, operation.keyspace(), cluster.datacenter(), cluster.replicationFactor());
-    }
-
-    private void assertDispatchAllowed(OperationRecord operation, AtomicBoolean lost) {
-        if (closing.get() || lost.get() || !execution.owns(operation))
-            throw new IllegalStateException("Worker stopped or ownership lost; no further dispatch permitted");
-        clusters.requireEnabled(operation.clusterId());
-    }
-
-    private RepairPolicy requirePolicy(OperationRecord operation) {
-        RepairPolicy policy = repairConfiguration.getPolicy(operation.clusterId());
-        if (policy == null || policy.version() != operation.repairPolicyVersion())
-            throw new IllegalStateException("Repair policy changed after operation acceptance");
-        return policy;
-    }
-
-    private void recordUncertainOrRequeue(OperationRecord operation, Exception exception) {
-        try {
-            if (claims.deferUndispatched(operation, exception.toString())) return;
-            String detail = "Verify remote activity before acknowledgement: " + exception;
-            if (detail.length() > 3500) detail = detail.substring(0, 3500);
-            execution.markUnknown(new OperationRecord(operation.id(), operation.clusterId(), operation.keyspace(),
-                operation.owner(), RepairState.UNKNOWN, detail, operation.repairPolicyVersion(), Instant.now()));
-        } catch (Exception stateFailure) {
-            log.warn("Cannot record uncertain repair {} (may already be fenced)", operation.id(), stateFailure);
+        } catch (Exception e) {
+            log.warn("Repair poll failed; durable work will be revisited", e);
         }
     }
 
     @PreDestroy
     public void close() {
-        closing.set(true);
-        if (!enabled) return;
-        poller.shutdownNow();
-        workers.shutdown();
-        try {
-            if (!workers.awaitTermination(5, TimeUnit.SECONDS)) {
-                workers.shutdownNow();
-                workers.awaitTermination(5, TimeUnit.SECONDS);
-            }
-        } catch (InterruptedException exception) {
-            workers.shutdownNow();
-            Thread.currentThread().interrupt();
-        }
-        leaseWorker.shutdownNow();
+        closing = true;
+        execution.close();
+        if (poller != null) poller.shutdownNow();
+        // Interrupting a local action does not cancel the remote Cassandra repair; it is observed again later.
+        if (workers != null) workers.shutdownNow();
     }
 }

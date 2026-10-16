@@ -1,58 +1,53 @@
 package demo.platform.cluster;
 
-import demo.platform.cluster.ClusterRecord.ClusterConfiguration;
-import demo.platform.cluster.ClusterRegistryService;
-import demo.platform.misc.CassandraConnectionManager;
-import demo.platform.misc.ControlPlaneExceptions;
+import demo.platform.cluster.cassandra.CassandraSessions;
+import demo.platform.cluster.cassandra.ClusterMetadataRepository;
+import demo.platform.common.ControlPlaneExceptions;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
-import java.util.Map;
 
+/** Cluster API use cases. */
 @Service
 @RequiredArgsConstructor
 public class ClusterService {
-    private final CassandraConnectionManager connections;
+    private final ClusterRegistryService registry;
     private final ClusterConfigurationService configurations;
-    private final ClusterRegistryService clusters;
+    private final CassandraSessions sessions;
+    private final ClusterMetadataRepository metadata;
 
     public List<ClusterRecord.Summary> list() {
-        return clusters.list();
+        return registry.list();
     }
 
-    public ClusterConfiguration details(String clusterId) {
-        ClusterConfiguration configuration = configurations.get(clusterId);
-        if (configuration == null) throw new ControlPlaneExceptions.UnknownCluster(clusterId);
-        return configuration;
+    public ClusterRecord details(String clusterId) {
+        ClusterRecord cluster = registry.get(clusterId);
+        if (cluster == null) throw new ControlPlaneExceptions.UnknownCluster(clusterId);
+        return cluster;
     }
 
-    public ClusterConfiguration save(ClusterConfiguration configuration) {
-        ClusterConfiguration previous = configurations.get(configuration.cluster().id());
-        ClusterConfiguration saved = configurations.save(configuration);
-        if (previous == null || previous.cluster().configVersion() != saved.cluster().configVersion())
-            connections.invalidate(saved.cluster().id());
-        connections.requestRefresh();
+    public ClusterRecord save(ClusterRecord cluster) {
+        ClusterRecord saved = configurations.save(cluster);
+        // A new version is picked up lazily on the next request; a disabled cluster gets no requests,
+        // so its session is closed here.
+        if (!saved.enabled()) sessions.invalidate(saved.id());
         return saved;
     }
 
-    public Map<String, Object> health(String clusterId) {
-        ClusterRecord.Settings cluster = clusters.requireEnabled(clusterId);
-        var available = connections.currentSession(cluster);
-        if (available.isEmpty()) {
-            return Map.of("clusterId", clusterId, "nodes", List.of(), "up", 0,
-                "expected", cluster.expectedNodes(), "quorumAvailable", false,
-                "status", "UNAVAILABLE", "note", "Cassandra connection retry is in progress");
-        }
-        var nodes = available.get().getMetadata().getNodes().values().stream().map(node -> Map.of(
-            "address", node.getEndPoint().toString(), "state", node.getState().name(),
-            "datacenter", String.valueOf(node.getDatacenter()))).toList();
-        long up = nodes.stream().filter(node -> node.get("state").equals("UP"))
-            .filter(node -> cluster.datacenter().equals(node.get("datacenter"))).count();
+    public ClusterHealth health(String clusterId) {
+        ClusterRecord.Settings cluster = registry.requireEnabled(clusterId);
+        var observed = metadata.nodes(cluster);
+        if (observed.isEmpty())
+            return new ClusterHealth(clusterId, List.of(), 0, cluster.expectedNodes(), false, "UNAVAILABLE",
+                "Cassandra connection is being established");
+        var nodes = observed.get().stream()
+            .map(node -> new ClusterHealth.NodeView(node.address(), node.state(), node.datacenter())).toList();
+        long up = observed.get().stream()
+            .filter(node -> node.up() && cluster.datacenter().equals(node.datacenter())).count();
         long quorum = cluster.replicationFactor() / 2L + 1;
-        return Map.of("clusterId", clusterId, "nodes", nodes, "up", up,
-            "expected", cluster.expectedNodes(), "quorumAvailable", up >= quorum,
-            "status", up == cluster.expectedNodes() ? "HEALTHY" : up >= quorum ? "DEGRADED" : "UNAVAILABLE",
-            "note", "Driver observations; successful LOCAL_QUORUM requests are the availability proof");
+        String status = up == cluster.expectedNodes() ? "HEALTHY" : up >= quorum ? "DEGRADED" : "UNAVAILABLE";
+        return new ClusterHealth(clusterId, nodes, up, cluster.expectedNodes(), up >= quorum, status,
+            "Driver observations; successful LOCAL_QUORUM requests are the availability proof");
     }
 }

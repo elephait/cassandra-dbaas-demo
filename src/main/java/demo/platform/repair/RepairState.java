@@ -1,9 +1,10 @@
 package demo.platform.repair;
 
-public enum RepairState {
-    QUEUED, CLAIMED, RUNNING, UNKNOWN, SUCCEEDED, FAILED, ACKNOWLEDGED;
+import java.util.List;
 
-    public boolean confirmedTerminal() {
-        return this == SUCCEEDED || this == FAILED;
-    }
+public enum RepairState {
+    QUEUED, CLAIMED, RUNNING, UNKNOWN, SUCCEEDED, ACKNOWLEDGED;
+
+    /** States that hold, or wait for, the cluster's single repair reservation. */
+    public static final List<RepairState> ACTIVE = List.of(QUEUED, CLAIMED, RUNNING, UNKNOWN);
 }

@@ -1,51 +1,26 @@
 package demo.platform.cluster.persistence;
 
+import demo.platform.cluster.ClusterRecord;
 import jakarta.persistence.LockModeType;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Lock;
-import org.springframework.data.jpa.repository.Query;
 
 import java.util.List;
 import java.util.Optional;
 
+/**
+ * Derived queries only. Record-returning finders are DTO projections: they select scalar columns and never
+ * load the lazy contact-point or address-mapping collections.
+ */
 public interface ClusterJpaRepository extends JpaRepository<ClusterEntity, String> {
+    /**
+     * {@code SELECT ... FOR UPDATE} on the cluster row: the per-cluster mutex that serializes configuration
+     * changes with keyspace and repair admission.
+     */
     @Lock(LockModeType.PESSIMISTIC_WRITE)
-    Optional<ClusterEntity> findLockedById(String id);
+    Optional<ClusterEntity> findForUpdateById(String id);
 
-    // Closed projection: scalars only, so it never touches the lazily loaded element collections or the
-    // repair policy. Session management polls this on a timer; it needs nothing else.
-    interface ConfigState {
-        String getId();
+    Optional<ClusterRecord.Settings> findSettingsById(String id);
 
-        long getConfigVersion();
-
-        boolean isEnabled();
-    }
-
-    @Query("select c.id as id, c.configVersion as configVersion, c.enabled as enabled "
-        + "from ClusterEntity c where c.enabled = true order by c.id")
-    List<ConfigState> findEnabledConfigStates();
-
-    @Query("select c.id as id, c.configVersion as configVersion, c.enabled as enabled "
-        + "from ClusterEntity c where c.id = :clusterId")
-    Optional<ConfigState> findConfigState(String clusterId);
-
-    @Query("select new demo.platform.cluster.ClusterRecord$Settings(c.id, c.datacenter, c.expectedNodes, "
-        + "c.replicationFactor, c.maxKeyspaces, c.provisioningLeaseSeconds, c.enabled, c.configVersion) "
-        + "from ClusterEntity c where c.id = :clusterId")
-    Optional<demo.platform.cluster.ClusterRecord.Settings> findSettings(String clusterId);
-
-    interface Summary {
-        String getId();
-        String getDatacenter();
-        int getExpectedNodes();
-        int getReplicationFactor();
-        boolean isEnabled();
-        long getConfigVersion();
-    }
-
-    @Query("select c.id as id, c.datacenter as datacenter, c.expectedNodes as expectedNodes, "
-        + "c.replicationFactor as replicationFactor, c.enabled as enabled, c.configVersion as configVersion "
-        + "from ClusterEntity c order by c.id")
-    List<Summary> findSummaries();
+    List<ClusterRecord.Summary> findSummariesByOrderByIdAsc();
 }

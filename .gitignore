@@ -1,8 +1,17 @@
-.m2/
+# Build output and the project-local Maven repository (see .mvn/maven.config)
 target/
-.local/
-.smoke/
+.m2/
 
+# Local runtime state: H2 database, generated JMX endpoint config, logs
+.local/
+*.log
+*.log.gz
+*.mv.db
+*.trace.db
+
+# IDE and OS files
 .idea/
 *.iml
-*.log
+.vscode/
+.DS_Store
+Thumbs.db

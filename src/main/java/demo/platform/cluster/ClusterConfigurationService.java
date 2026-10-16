@@ -1,79 +1,48 @@
 package demo.platform.cluster;
 
-import demo.platform.cluster.ClusterRecord.ClusterConfiguration;
-import demo.platform.cluster.persistence.ClusterRepository;
-import demo.platform.keyspace.KeyspaceProvisioningService;
-import demo.platform.misc.ControlPlaneExceptions;
-import demo.platform.repair.RepairConfigurationService;
-import demo.platform.repair.RepairQueueService;
-import demo.platform.repair.OperationRecord.RepairPolicy;
+import demo.platform.cluster.persistence.ClusterEntity;
+import demo.platform.cluster.persistence.ClusterJpaRepository;
+import demo.platform.common.ControlPlaneExceptions;
 import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Isolation;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.util.List;
-
+/** Writes cluster configuration. Separate from the registry so other domains can depend on reads only. */
 @Service
 @RequiredArgsConstructor
 public class ClusterConfigurationService {
-    private final ClusterRepository clusters;
-    private final RepairConfigurationService repairs;
-    private final RepairQueueService queue;
-    private final KeyspaceProvisioningService provisioning;
+    private final ClusterJpaRepository clusters;
+    private final ObjectProvider<PendingClusterWork> pendingWork;
 
+    /** Creates or updates a cluster. An identical replay is a no-op and keeps the version. */
     @Transactional
-    public ClusterConfiguration register(ClusterConfiguration configuration) {
-        ClusterRecord previous = clusters.lockConfiguration(configuration.cluster().id());
-        boolean bootstrap = previous == null || previous.configVersion() == 0;
-        ClusterRecord cluster = bootstrap ? clusters.saveLocked(configuration.cluster()) : previous;
-        if (previous == null) queue.initializeCluster(cluster.id());
-        RepairPolicy existing = repairs.getPolicy(cluster.id());
-        RepairPolicy policy = bootstrap || existing == null
-            ? repairs.savePolicy(configuration.repairPolicy()) : existing;
-        return new ClusterConfiguration(cluster, policy);
+    public ClusterRecord save(ClusterRecord cluster) {
+        // Same row lock as admission: no keyspace or repair can be admitted half-way through a change.
+        ClusterEntity entity = clusters.findForUpdateById(cluster.id()).orElse(null);
+        if (entity != null) {
+            if (entity.matches(cluster)) return entity.toRecord();
+            if (pendingWork.orderedStream().anyMatch(work -> work.hasPendingWork(cluster.id())))
+                throw new ControlPlaneExceptions.Conflict(
+                    "Cluster configuration cannot change while provisioning or repair work is pending");
+        } else {
+            entity = new ClusterEntity(cluster.id());
+        }
+        entity.apply(cluster);
+        return clusters.saveAndFlush(entity).toRecord();
     }
 
+    /**
+     * Applies bootstrap configuration once: when the cluster is missing or still the migration's placeholder
+     * (version 0). Returns true when it was applied.
+     */
     @Transactional
-    public ClusterConfiguration save(ClusterConfiguration configuration) {
-        String clusterId = configuration.cluster().id();
-        // Lock first: provisioning and repair admission use this same cluster row.
-        ClusterRecord previous = clusters.lockConfiguration(clusterId);
-        if (previous != null) rejectUpdateWithPendingWork(clusterId);
-        ClusterRecord cluster = clusters.saveLocked(configuration.cluster());
-        if (previous == null) queue.initializeCluster(clusterId);
-        RepairPolicy policy = repairs.savePolicy(configuration.repairPolicy());
-        return new ClusterConfiguration(cluster, policy);
-    }
-
-    private void rejectUpdateWithPendingWork(String clusterId) {
-        if (queue.hasPendingWork(clusterId) || provisioning.hasPendingWork(clusterId))
-            throw new ControlPlaneExceptions.Conflict(
-                "Cluster configuration cannot change while provisioning or repair work is pending");
-    }
-
-    @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
-    public ClusterConfiguration get(String clusterId) {
-        ClusterRecord cluster = clusters.get(clusterId);
-        if (cluster == null) return null;
-        RepairPolicy policy = repairs.getPolicy(cluster.id());
-        return policy == null ? null : new ClusterConfiguration(cluster, policy);
-    }
-
-    // Session management compares configuration versions on a timer; it must not hydrate repair
-    // policies, contact points or address mappings to do that.
-    @Transactional(readOnly = true)
-    public List<ClusterRecord.ConfigState> listConnectionStates() {
-        return clusters.listEnabledConfigStates();
-    }
-
-    @Transactional(readOnly = true)
-    public ClusterRecord connectionDetails(String clusterId) {
-        return clusters.get(clusterId);
-    }
-
-    @Transactional(readOnly = true)
-    public ClusterRecord.ConfigState connectionState(String clusterId) {
-        return clusters.getConfigState(clusterId);
+    public boolean register(ClusterRecord bootstrap) {
+        ClusterEntity entity = clusters.findForUpdateById(bootstrap.id()).orElse(null);
+        if (entity != null && entity.configVersion() > 0) return false;
+        if (entity == null) entity = new ClusterEntity(bootstrap.id());
+        entity.apply(bootstrap);
+        clusters.saveAndFlush(entity);
+        return true;
     }
 }

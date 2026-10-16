@@ -1,18 +1,18 @@
 package demo.platform.cluster.persistence;
 
-import org.hibernate.annotations.BatchSize;
-import org.hibernate.annotations.JdbcTypeCode;
-import org.hibernate.type.SqlTypes;
-
+import demo.platform.cluster.ClusterRecord;
+import demo.platform.cluster.ClusterRecord.AddressMapping;
+import demo.platform.cluster.ClusterRecord.ContactPoint;
+import jakarta.persistence.*;
 import lombok.AccessLevel;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.experimental.Accessors;
-
-import jakarta.persistence.*;
+import org.hibernate.annotations.BatchSize;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -67,37 +67,43 @@ public class ClusterEntity {
     private long configVersion;
 
     @Column(name = "updated_at", nullable = false)
-    @JdbcTypeCode(SqlTypes.TIMESTAMP)
     private Instant updatedAt;
 
     public ClusterEntity(String id) {
         this.id = id;
     }
 
-    public void update(List<ContactPointEmbeddable> points, String datacenter, int expectedNodes,
-                       int replicationFactor, Set<AddressMappingEmbeddable> mappings,
-                       int requestTimeoutSeconds, int reconnectSeconds, int maxKeyspaces,
-                       int provisioningLeaseSeconds, boolean enabled) {
-        this.contactPoints.clear();
-        this.contactPoints.addAll(points);
-        this.datacenter = datacenter;
-        this.expectedNodes = expectedNodes;
-        this.replicationFactor = replicationFactor;
-        this.addressMappings.clear();
-        this.addressMappings.addAll(mappings);
-        this.requestTimeoutSeconds = requestTimeoutSeconds;
-        this.reconnectSeconds = reconnectSeconds;
-        this.maxKeyspaces = maxKeyspaces;
-        this.provisioningLeaseSeconds = provisioningLeaseSeconds;
-        this.enabled = enabled;
+    /** Copies settings from the domain record; the version is managed by JPA. */
+    public void apply(ClusterRecord cluster) {
+        contactPoints.clear();
+        cluster.contactPoints().forEach(point -> contactPoints.add(new ContactPointEmbeddable(point.host(), point.port())));
+        addressMappings.clear();
+        cluster.addressMappings().forEach(mapping -> addressMappings.add(new AddressMappingEmbeddable(
+            mapping.discoveredHost(), mapping.target().host(), mapping.target().port())));
+        datacenter = cluster.datacenter();
+        expectedNodes = cluster.expectedNodes();
+        replicationFactor = cluster.replicationFactor();
+        requestTimeoutSeconds = cluster.requestTimeoutSeconds();
+        reconnectSeconds = cluster.reconnectSeconds();
+        maxKeyspaces = cluster.maxKeyspaces();
+        provisioningLeaseSeconds = cluster.provisioningLeaseSeconds();
+        enabled = cluster.enabled();
     }
 
-    public List<ContactPointEmbeddable> contactPoints() {
-        return List.copyOf(contactPoints);
+    /** True when applying the record would change nothing, so the version must not move. */
+    public boolean matches(ClusterRecord cluster) {
+        return toRecord().equals(cluster.withVersion(configVersion));
     }
 
-    public Set<AddressMappingEmbeddable> addressMappings() {
-        return Set.copyOf(addressMappings);
+    public ClusterRecord toRecord() {
+        List<ContactPoint> points = contactPoints.stream()
+            .map(point -> new ContactPoint(point.host(), point.port())).toList();
+        List<AddressMapping> mappings = addressMappings.stream()
+            .map(mapping -> new AddressMapping(mapping.discoveredHost(),
+                new ContactPoint(mapping.targetHost(), mapping.targetPort())))
+            .sorted(Comparator.comparing(AddressMapping::discoveredHost)).toList();
+        return new ClusterRecord(id, points, datacenter, expectedNodes, replicationFactor, mappings,
+            requestTimeoutSeconds, reconnectSeconds, maxKeyspaces, provisioningLeaseSeconds, enabled, configVersion);
     }
 
     @PrePersist

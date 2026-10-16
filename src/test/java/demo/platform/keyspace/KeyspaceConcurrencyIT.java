@@ -4,8 +4,8 @@ import demo.platform.PlatformApplication;
 import demo.platform.cluster.ClusterRegistryService;
 import demo.platform.keyspace.persistence.KeyspaceId;
 import demo.platform.keyspace.persistence.KeyspaceJpaRepository;
-import demo.platform.misc.CassandraConnectionManager;
-import demo.platform.misc.ControlPlaneExceptions;
+import demo.platform.cluster.cassandra.CassandraSessions;
+import demo.platform.common.ControlPlaneExceptions;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.builder.SpringApplicationBuilder;
@@ -43,17 +43,21 @@ import static org.junit.jupiter.api.Assertions.*;
 @Testcontainers
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 class KeyspaceConcurrencyIT {
-    private static final String ADMIN_TOKEN = "integration-only";
-    private static final int QUOTA = 4;
-
     @Container
     static final CassandraContainer cassandra = new CassandraContainer("cassandra:5.0.5")
         .withEnv("MAX_HEAP_SIZE", "512M").withEnv("HEAP_NEWSIZE", "100M")
         .withStartupTimeout(Duration.ofMinutes(5));
-
     @Container
     static final PostgreSQLContainer postgres = new PostgreSQLContainer("postgres:17.6")
         .withDatabaseName("dbaas").withUsername("dbaas").withPassword("integration-only");
+    private static final String ADMIN_TOKEN = "integration-only";
+    private static final int QUOTA = 4;
+    @LocalServerPort
+    int port;
+    @Autowired
+    ConfigurableApplicationContext first;
+    @Autowired
+    JsonMapper json;
 
     @DynamicPropertySource
     static void properties(DynamicPropertyRegistry registry) {
@@ -80,19 +84,73 @@ class KeyspaceConcurrencyIT {
             + ":" + cassandra.getMappedPort(9042));
         properties.put("demo.admin-token", ADMIN_TOKEN);
         properties.put("demo.max-keyspaces", Integer.toString(QUOTA));
-        properties.put("demo.repair.nodes", "integration-node");
         properties.put("demo.repair.worker-threads", "1");
         properties.put("server.address", "127.0.0.1");
         properties.put("server.port", "0");
         return properties;
     }
 
-    @LocalServerPort
-    int port;
-    @Autowired
-    ConfigurableApplicationContext first;
-    @Autowired
-    JsonMapper json;
+    private static HttpResponse<String> post(HttpClient client, int serverPort, String keyspace) throws Exception {
+        return client.send(HttpRequest.newBuilder(url(serverPort, keyspace)).header("X-Admin-Token", ADMIN_TOKEN)
+                .timeout(Duration.ofSeconds(30)).POST(HttpRequest.BodyPublishers.noBody()).build(),
+            HttpResponse.BodyHandlers.ofString());
+    }
+
+    private static URI url(int serverPort, String keyspace) {
+        return URI.create("http://127.0.0.1:" + serverPort + "/clusters/default/keyspaces/" + keyspace);
+    }
+
+    private static String name(String prefix) {
+        return prefix + "_" + UUID.randomUUID().toString().replace("-", "");
+    }
+
+    private static void awaitReady(HttpClient client, int serverPort, String keyspace) throws Exception {
+        await(Duration.ofSeconds(90), () -> {
+            var response = post(client, serverPort, keyspace);
+            assertTrue(List.of(200, 409, 503).contains(response.statusCode()), response.body());
+            return response.statusCode() == 200;
+        });
+    }
+
+    private static void awaitConnected(ConfigurableApplicationContext context) throws Exception {
+        await(Duration.ofSeconds(120), () -> {
+            var cluster = context.getBean(ClusterRegistryService.class).requireEnabled("default");
+            return context.getBean(CassandraSessions.class).current(cluster)
+                .map(session -> session.getMetadata().getNodes().values().stream()
+                    .anyMatch(node -> node.getState().name().equals("UP")) && session.checkSchemaAgreement())
+                .orElse(false);
+        });
+    }
+
+    private static void await(Duration timeout, Callable<Boolean> condition) throws Exception {
+        long deadline = System.nanoTime() + timeout.toNanos();
+        while (!condition.call()) {
+            if (System.nanoTime() >= deadline) fail("Condition did not converge within " + timeout);
+            Thread.sleep(250);
+        }
+    }
+
+    private static <T> List<T> race(List<Callable<T>> requests) throws Exception {
+        var pool = Executors.newFixedThreadPool(requests.size());
+        var ready = new CountDownLatch(requests.size());
+        var start = new CountDownLatch(1);
+        try {
+            var futures = requests.stream().map(request -> pool.submit(() -> {
+                ready.countDown();
+                if (!start.await(10, TimeUnit.SECONDS)) throw new IllegalStateException("Race start timed out");
+                return request.call();
+            })).toList();
+            assertTrue(ready.await(10, TimeUnit.SECONDS));
+            start.countDown();
+            var results = new java.util.ArrayList<T>();
+            for (var future : futures) results.add(future.get(60, TimeUnit.SECONDS));
+            return results;
+        } finally {
+            start.countDown();
+            pool.shutdownNow();
+            assertTrue(pool.awaitTermination(10, TimeUnit.SECONDS));
+        }
+    }
 
     @Test
     void httpProvisioningIsDeduplicatedQuotaSafeAndRecoverableAcrossInstances() throws Exception {
@@ -145,7 +203,7 @@ class KeyspaceConcurrencyIT {
             second.getBean(TransactionTemplate.class).executeWithoutResult(status -> {
                 var row = entities.findById(new KeyspaceId("default", recovery)).orElseThrow();
                 // Deterministic expiry fixture, not a claim that closing an instance cancels remote work.
-                row.claim(oldOwner.owner(), entities.databaseTime().toInstant().minusSeconds(120), 60);
+                row.claim(oldOwner.owner(), second.getBean(demo.platform.common.DatabaseClock.class).now().minusSeconds(120), 60);
                 entities.saveAndFlush(row);
             });
             second.close();
@@ -162,7 +220,7 @@ class KeyspaceConcurrencyIT {
 
     private JsonNode list(HttpClient client, int serverPort) throws Exception {
         var response = client.send(HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + serverPort
-            + "/clusters/default/keyspaces?limit=200")).header("X-Admin-Token", ADMIN_TOKEN)
+                + "/clusters/default/keyspaces?limit=200")).header("X-Admin-Token", ADMIN_TOKEN)
             .timeout(Duration.ofSeconds(30)).GET().build(), HttpResponse.BodyHandlers.ofString());
         assertEquals(200, response.statusCode(), response.body());
         return json.readTree(response.body());
@@ -177,67 +235,5 @@ class KeyspaceConcurrencyIT {
             }
         }
         return count;
-    }
-
-    private static HttpResponse<String> post(HttpClient client, int serverPort, String keyspace) throws Exception {
-        return client.send(HttpRequest.newBuilder(url(serverPort, keyspace)).header("X-Admin-Token", ADMIN_TOKEN)
-            .timeout(Duration.ofSeconds(30)).POST(HttpRequest.BodyPublishers.noBody()).build(),
-            HttpResponse.BodyHandlers.ofString());
-    }
-
-    private static URI url(int serverPort, String keyspace) {
-        return URI.create("http://127.0.0.1:" + serverPort + "/clusters/default/keyspaces/" + keyspace);
-    }
-
-    private static String name(String prefix) {
-        return prefix + "_" + UUID.randomUUID().toString().replace("-", "");
-    }
-
-    private static void awaitReady(HttpClient client, int serverPort, String keyspace) throws Exception {
-        await(Duration.ofSeconds(90), () -> {
-            var response = post(client, serverPort, keyspace);
-            assertTrue(List.of(200, 409, 503).contains(response.statusCode()), response.body());
-            return response.statusCode() == 200;
-        });
-    }
-
-    private static void awaitConnected(ConfigurableApplicationContext context) throws Exception {
-        await(Duration.ofSeconds(120), () -> {
-            var cluster = context.getBean(ClusterRegistryService.class).requireEnabled("default");
-            return context.getBean(CassandraConnectionManager.class).currentSession(cluster)
-                .map(session -> session.getMetadata().getNodes().values().stream()
-                    .anyMatch(node -> node.getState().name().equals("UP")) && session.checkSchemaAgreement())
-                .orElse(false);
-        });
-    }
-
-    private static void await(Duration timeout, Callable<Boolean> condition) throws Exception {
-        long deadline = System.nanoTime() + timeout.toNanos();
-        while (!condition.call()) {
-            if (System.nanoTime() >= deadline) fail("Condition did not converge within " + timeout);
-            Thread.sleep(250);
-        }
-    }
-
-    private static <T> List<T> race(List<Callable<T>> requests) throws Exception {
-        var pool = Executors.newFixedThreadPool(requests.size());
-        var ready = new CountDownLatch(requests.size());
-        var start = new CountDownLatch(1);
-        try {
-            var futures = requests.stream().map(request -> pool.submit(() -> {
-                ready.countDown();
-                if (!start.await(10, TimeUnit.SECONDS)) throw new IllegalStateException("Race start timed out");
-                return request.call();
-            })).toList();
-            assertTrue(ready.await(10, TimeUnit.SECONDS));
-            start.countDown();
-            var results = new java.util.ArrayList<T>();
-            for (var future : futures) results.add(future.get(60, TimeUnit.SECONDS));
-            return results;
-        } finally {
-            start.countDown();
-            pool.shutdownNow();
-            assertTrue(pool.awaitTermination(10, TimeUnit.SECONDS));
-        }
     }
 }

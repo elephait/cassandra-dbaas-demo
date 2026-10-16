@@ -1,14 +1,9 @@
 package demo.platform.cluster.persistence;
 
-import lombok.AllArgsConstructor;
-import lombok.AccessLevel;
-import lombok.Getter;
-import lombok.EqualsAndHashCode;
-import lombok.NoArgsConstructor;
-import lombok.experimental.Accessors;
-
 import jakarta.persistence.Column;
 import jakarta.persistence.Embeddable;
+import lombok.*;
+import lombok.experimental.Accessors;
 
 @Embeddable
 @EqualsAndHashCode

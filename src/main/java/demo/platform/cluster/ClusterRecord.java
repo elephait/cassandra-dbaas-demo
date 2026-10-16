@@ -1,6 +1,5 @@
 package demo.platform.cluster;
 
-import demo.platform.repair.OperationRecord.RepairPolicy;
 import java.net.InetSocketAddress;
 import java.util.List;
 
@@ -43,11 +42,6 @@ public record ClusterRecord(
             provisioningLeaseSeconds, enabled, configVersion);
     }
 
-    // Operational reads need current scalar settings, not connection collections.
-    public record Settings(String id, String datacenter, int expectedNodes, int replicationFactor,
-                           int maxKeyspaces, int provisioningLeaseSeconds, boolean enabled, long configVersion) {
-    }
-
     public ClusterRecord withVersion(long version) {
         return new ClusterRecord(id, contactPoints, datacenter, expectedNodes, replicationFactor,
             addressMappings, requestTimeoutSeconds, reconnectSeconds, maxKeyspaces,
@@ -56,6 +50,12 @@ public record ClusterRecord(
 
     public boolean addressTranslationEnabled() {
         return !addressMappings.isEmpty();
+    }
+
+    // Operational reads need current scalar settings, not connection collections.
+    // Component names match entity attributes: Spring Data builds these as DTO projections.
+    public record Settings(String id, String datacenter, int expectedNodes, int replicationFactor,
+                           int maxKeyspaces, int provisioningLeaseSeconds, boolean enabled, long configVersion) {
     }
 
     public record ContactPoint(String host, int port) {
@@ -78,21 +78,8 @@ public record ClusterRecord(
         }
     }
 
-    public record ClusterConfiguration(ClusterRecord cluster, RepairPolicy repairPolicy) {
-        public ClusterConfiguration {
-            if (cluster == null || repairPolicy == null)
-                throw new IllegalArgumentException("Cluster and repair policy are required");
-            if (!cluster.id().equals(repairPolicy.clusterId()))
-                throw new IllegalArgumentException("Cluster and repair policy ids must match");
-        }
-    }
-
-    // Inventory contains scalars only; full connection settings and repair policy belong to details.
+    // Inventory contains scalars only; full connection settings belong to details.
     public record Summary(String id, String datacenter, int expectedNodes, int replicationFactor,
                           boolean enabled, long configVersion) {
-    }
-
-    // Connection polling needs only identity, version and enablement.
-    public record ConfigState(String clusterId, long configVersion, boolean enabled) {
     }
 }

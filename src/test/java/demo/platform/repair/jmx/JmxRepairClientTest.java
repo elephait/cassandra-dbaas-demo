@@ -1,6 +1,7 @@
 package demo.platform.repair.jmx;
 
 import org.junit.jupiter.api.Test;
+
 import javax.management.MBeanServerFactory;
 import javax.management.ObjectName;
 import javax.management.remote.JMXConnectorServerFactory;
@@ -11,45 +12,37 @@ import java.rmi.registry.LocateRegistry;
 import java.rmi.server.UnicastRemoteObject;
 import java.util.List;
 import java.util.Map;
-import static org.junit.jupiter.api.Assertions.*;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class JmxRepairClientTest {
     // These are decoder/plumbing tests, not evidence of the real Cassandra contract.
     // JmxCassandraIT verifies the pinned server; verification/jmx retains its reports.
-    @Test void decodesKnownParentRepairStates() {
+    @Test
+    void decodesKnownParentRepairStates() {
         for (String state : List.of("IN_PROGRESS", "COMPLETED", "FAILED"))
             assertEquals(RepairManagementClient.Status.valueOf(state),
                 JmxRepairClient.decodeStatus(List.of(state, "message")).status());
     }
 
-    @Test void missingStatusIsDistinctFromAnUnrecognizedResponse() {
+    @Test
+    void missingStatusIsDistinctFromAnUnrecognizedResponse() {
         assertEquals(RepairManagementClient.Status.MISSING, JmxRepairClient.decodeStatus(null).status());
     }
 
-    @Test void incompatibleResponsesAreVisibleInsteadOfBeingRetriedAsConnectivityFailures() {
+    @Test
+    void incompatibleResponsesAreVisibleInsteadOfBeingRetriedAsConnectivityFailures() {
         for (Object response : List.of(List.of("NEW_SERVER_STATE"), List.of(), "bad response"))
             assertEquals(RepairManagementClient.Status.UNRECOGNIZED, JmxRepairClient.decodeStatus(response).status());
     }
-    public interface StorageServiceMBean {
-        String getLocalHostId();
-        int repairAsync(String keyspace, Map<String, String> options);
-        List<String> getParentRepairStatus(int command);
-    }
-    public static class StorageService implements StorageServiceMBean {
-        String keyspace;
-        Map<String, String> options;
-        public String getLocalHostId() { return "a4bc61ec-0ef2-4e28-9cbe-5a2ce03667f2"; }
-        public int repairAsync(String keyspace, Map<String, String> options) {
-            this.keyspace = keyspace; this.options = options; return 23;
-        }
-        public List<String> getParentRepairStatus(int command) {
-            return command == 23 ? List.of("COMPLETED", "finished") : null;
-        }
-    }
 
-    @Test void invokesRealJmxTransportWithCassandraSignaturesAndOptions() throws Exception {
+    @Test
+    void invokesRealJmxTransportWithCassandraSignaturesAndOptions() throws Exception {
         int port;
-        try (var socket = new ServerSocket(0)) { port = socket.getLocalPort(); }
+        try (var socket = new ServerSocket(0)) {
+            port = socket.getLocalPort();
+        }
         var registry = LocateRegistry.createRegistry(port);
         var server = MBeanServerFactory.createMBeanServer();
         var storage = new StorageService();
@@ -75,6 +68,33 @@ class JmxRepairClientTest {
             connector.stop();
             UnicastRemoteObject.unexportObject(registry, true);
             MBeanServerFactory.releaseMBeanServer(server);
+        }
+    }
+
+    public interface StorageServiceMBean {
+        String getLocalHostId();
+
+        int repairAsync(String keyspace, Map<String, String> options);
+
+        List<String> getParentRepairStatus(int command);
+    }
+
+    public static class StorageService implements StorageServiceMBean {
+        String keyspace;
+        Map<String, String> options;
+
+        public String getLocalHostId() {
+            return "a4bc61ec-0ef2-4e28-9cbe-5a2ce03667f2";
+        }
+
+        public int repairAsync(String keyspace, Map<String, String> options) {
+            this.keyspace = keyspace;
+            this.options = options;
+            return 23;
+        }
+
+        public List<String> getParentRepairStatus(int command) {
+            return command == 23 ? List.of("COMPLETED", "finished") : null;
         }
     }
 }

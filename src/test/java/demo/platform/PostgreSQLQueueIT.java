@@ -1,13 +1,11 @@
 package demo.platform;
 
-import demo.platform.cluster.ClusterRecord.ContactPoint;
-import demo.platform.cluster.ClusterRecord;
-import demo.platform.misc.ControlPlaneExceptions;
-import demo.platform.repair.OperationRecord.RepairPolicy;
+import demo.platform.common.DatabaseClock;
 import demo.platform.repair.OperationRecord;
 import demo.platform.repair.RepairClaimService;
-import demo.platform.repair.RepairConfigurationService;
+import demo.platform.repair.RepairRuns;
 import demo.platform.repair.RepairState;
+import demo.platform.repair.jmx.JmxRepairProperties;
 import demo.platform.repair.persistence.RepairExecutionRepository;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.Test;
@@ -21,112 +19,116 @@ import org.testcontainers.postgresql.PostgreSQLContainer;
 
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.when;
 
+/**
+ * Two independent "replicas" (separate connection pools and repositories) against real PostgreSQL:
+ * proves SKIP LOCKED claims, lease fencing and handoff of an abandoned submission.
+ */
 @Testcontainers
 class PostgreSQLQueueIT {
     @Container
     static final PostgreSQLContainer postgres = new PostgreSQLContainer("postgres:17.6")
         .withDatabaseName("queue_test").withUsername("postgres").withPassword("integration-only");
 
-    private record Worker(RepairExecutionRepository execution, RepairClaimService claims) {
-    }
-
-    private static Worker worker(JdbcTemplate jdbc, TransactionTemplate transactions) {
-        RepairConfigurationService repairConfiguration = mock(RepairConfigurationService.class);
-        when(repairConfiguration.getPolicy("default")).thenReturn(policy());
-        var execution = new RepairExecutionRepository(jdbc, transactions);
-        var claims = new RepairClaimService(execution, repairConfiguration) {
+    private static Replica replica(DriverManagerDataSource dataSource) {
+        var jdbc = new JdbcTemplate(dataSource);
+        var transactions = new TransactionTemplate(new DataSourceTransactionManager(dataSource));
+        var execution = new RepairExecutionRepository(jdbc, transactions, new DatabaseClock(jdbc));
+        var claims = new RepairClaimService(execution, new JmxRepairProperties()) {
             @Override
-            public OperationRecord claim(int seconds) {
-                return transactions.execute(status -> super.claim(seconds));
+            public OperationRecord claim() {
+                return transactions.execute(status -> super.claim());
             }
         };
-        return new Worker(execution, claims);
+        return new Replica(jdbc, execution, claims);
     }
 
-    private static OperationRecord operation(JdbcTemplate jdbc, UUID id) {
-        return jdbc.queryForObject("SELECT operation_id, cluster_id, keyspace_name, owner_id, state, detail, "
-                + "repair_policy_version, updated_at FROM operations WHERE operation_id = ?",
-            (rs, row) -> new OperationRecord(UUID.fromString(rs.getString("operation_id")),
-                rs.getString("cluster_id"), rs.getString("keyspace_name"), rs.getString("owner_id"),
-                RepairState.valueOf(rs.getString("state")), rs.getString("detail"), rs.getLong("repair_policy_version"),
-                rs.getTimestamp("updated_at").toInstant()), id.toString());
+    private static <T> List<T> race(ExecutorService pool, Callable<T> a, Callable<T> b) throws Exception {
+        var gate = new CountDownLatch(1);
+        var first = pool.submit(() -> {
+            gate.await();
+            return a.call();
+        });
+        var second = pool.submit(() -> {
+            gate.await();
+            return b.call();
+        });
+        gate.countDown();
+        return java.util.Arrays.asList(first.get(10, TimeUnit.SECONDS), second.get(10, TimeUnit.SECONDS));
     }
 
-    private static ClusterRecord cluster() {
-        return new ClusterRecord("default", List.of(new ContactPoint("localhost", 9042)),
-            "dc1", 3, 3, List.of(), 10, 60, 10, 60, true, 1);
-    }
-
-    private static RepairPolicy policy() {
-        return new RepairPolicy("default", List.of("node1"),
-            "nodetool repair -pr {keyspace}", 60, 1);
+    private static String state(JdbcTemplate jdbc, UUID id) {
+        return jdbc.queryForObject("SELECT state FROM operations WHERE operation_id = ?", String.class, id.toString());
     }
 
     @Test
-    void twoIndependentWorkersClaimOnceAndRecoverUndispatchedWork() throws Exception {
+    void replicasClaimOnceFenceStaleOwnersAndNeverResubmitAnAbandonedSubmission() throws Exception {
         String url = postgres.getJdbcUrl();
-        String user = postgres.getUsername();
-        String password = postgres.getPassword();
-        var aDataSource = new DriverManagerDataSource(url, user, password);
-        var bDataSource = new DriverManagerDataSource(url, user, password);
+        var aDataSource = new DriverManagerDataSource(url, postgres.getUsername(), postgres.getPassword());
+        var bDataSource = new DriverManagerDataSource(url, postgres.getUsername(), postgres.getPassword());
         Flyway.configure().dataSource(aDataSource).load().migrate();
-        var aJdbc = new JdbcTemplate(aDataSource);
-        var bJdbc = new JdbcTemplate(bDataSource);
+        Replica a = replica(aDataSource);
+        Replica b = replica(bDataSource);
         UUID operationId = UUID.randomUUID();
-        aJdbc.update("INSERT INTO operations (operation_id, cluster_id, keyspace_name, state, detail, "
-                + "updated_at, request_key, repair_policy_version) "
-                + "VALUES (?, 'default', 'queue_test', 'QUEUED', 'queued', CURRENT_TIMESTAMP, ?, 1)",
+        a.jdbc().update("INSERT INTO operations (operation_id, cluster_id, keyspace_name, state, detail, "
+                + "updated_at, request_key) VALUES (?, 'default', 'queue_test', 'QUEUED', 'queued', CURRENT_TIMESTAMP, ?)",
             operationId.toString(), UUID.randomUUID().toString());
-
-        Worker a = worker(aJdbc,
-            new TransactionTemplate(new DataSourceTransactionManager(aDataSource)));
-        Worker b = worker(bJdbc,
-            new TransactionTemplate(new DataSourceTransactionManager(bDataSource)));
         var pool = Executors.newFixedThreadPool(2);
-        var gate = new CountDownLatch(1);
         try {
-            var firstClaim = pool.submit(() -> {
-                gate.await();
-                return a.claims().claim(60);
-            });
-            var secondClaim = pool.submit(() -> {
-                gate.await();
-                return b.claims().claim(60);
-            });
-            gate.countDown();
-            var first = firstClaim.get(10, TimeUnit.SECONDS);
-            var second = secondClaim.get(10, TimeUnit.SECONDS);
-            assertTrue((first == null) != (second == null));
-            var old = first == null ? second : first;
+            // 1. Concurrent run claims: exactly one replica wins the cluster reservation.
+            var claims = race(pool, () -> a.claims().claim(), () -> b.claims().claim());
+            assertEquals(1, claims.stream().filter(java.util.Objects::nonNull).count());
+            var old = claims.get(0) != null ? claims.get(0) : claims.get(1);
             assertEquals(operationId, old.id());
-            aJdbc.update("UPDATE repair_locks SET expires_at = CURRENT_TIMESTAMP - INTERVAL '1 second' "
+
+            // 2. The winner dies before persisting a plan: its lease expires and another replica requeues it.
+            a.jdbc().update("UPDATE repair_locks SET expires_at = CURRENT_TIMESTAMP - INTERVAL '1 second' "
                 + "WHERE owner_id = ?", old.owner());
-            b.execution().reconcileExpired();
-            var replacement = b.claims().claim(60);
+            assertEquals(1, b.execution().reconcileExpired());
+            var replacement = b.claims().claim();
             assertNotEquals(old.owner(), replacement.owner());
-            assertFalse(a.execution().renew(old.owner(), 60));
-            assertThrows(ControlPlaneExceptions.Conflict.class, () -> a.execution().markDispatched(old));
-            b.execution().markDispatched(replacement);
-            aJdbc.update("UPDATE repair_locks SET expires_at = CURRENT_TIMESTAMP - INTERVAL '1 second' "
-                + "WHERE owner_id = ?", replacement.owner());
-            a.execution().reconcileExpired();
-            assertEquals(RepairState.UNKNOWN, operation(aJdbc, operationId).state());
-            assertNull(a.claims().claim(60));
-            var acknowledgementA = pool.submit(() -> a.execution().acknowledge(operationId));
-            var acknowledgementB = pool.submit(() -> b.execution().acknowledge(operationId));
-            acknowledgementA.get(10, TimeUnit.SECONDS);
-            acknowledgementB.get(10, TimeUnit.SECONDS);
-            a.execution().acknowledge(operationId);
+            assertThrows(IllegalStateException.class, () -> a.execution().initialize(old, RepairRuns.plan()));
+            b.execution().initialize(replacement, RepairRuns.plan());
+
+            // 3. Concurrent node-action claims: exactly one replica gets the action lease.
+            var tasks = race(pool, () -> a.execution().claimTask(60), () -> b.execution().claimTask(60));
+            assertEquals(1, tasks.stream().filter(java.util.Objects::nonNull).count());
+            var task = tasks.get(0) != null ? tasks.get(0) : tasks.get(1);
+            assertTrue(a.execution().submitting(task, 1));
+
+            // 4. That worker dies mid-submission; the next claimer must not resubmit.
+            a.jdbc().update("UPDATE repair_node_progress SET action_expires_at = CURRENT_TIMESTAMP - INTERVAL '1 second'");
+            var abandoned = b.execution().claimTask(60);
+            assertEquals("SUBMITTING", abandoned.state());
+            assertThrows(IllegalStateException.class, () -> a.execution().submitted(task, 17, 1));
+            b.execution().unknown(abandoned, "Worker disappeared during JMX submission");
+            assertEquals(RepairState.UNKNOWN.name(), state(a.jdbc(), operationId));
+            assertEquals(0, a.execution().reconcileExpired());
+            assertNull(a.claims().claim());
+
+            // 5. Concurrent acknowledgements are idempotent and release the reservation once.
+            race(pool, () -> {
+                a.execution().acknowledge(operationId);
+                return true;
+            }, () -> {
+                b.execution().acknowledge(operationId);
+                return true;
+            });
+            assertEquals(RepairState.ACKNOWLEDGED.name(), state(a.jdbc(), operationId));
+            assertNull(a.jdbc().queryForObject("SELECT owner_id FROM repair_locks WHERE cluster_id = 'default'",
+                String.class));
         } finally {
             pool.shutdownNow();
         }
+    }
+
+    private record Replica(JdbcTemplate jdbc, RepairExecutionRepository execution, RepairClaimService claims) {
     }
 }

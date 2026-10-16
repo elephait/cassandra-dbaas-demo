@@ -1,46 +1,35 @@
 package demo.platform.keyspace;
 
-import demo.platform.misc.AdminAccess;
+import demo.platform.common.PageLimits;
 import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
-import java.util.Map;
 
+/** HTTP mapping only; authorization is applied by the admin-token interceptor. */
 @RestController
+@RequestMapping("/clusters/{clusterId}/keyspaces")
 @RequiredArgsConstructor
 public class KeyspaceController {
     private final KeyspaceService service;
-    private final AdminAccess admin;
 
-    @PostMapping("/clusters/{clusterId}/keyspaces/{keyspace}")
-    public Map<String, Object> provision(
-        @PathVariable String clusterId,
-        @PathVariable String keyspace,
-        @RequestHeader(value = "X-Admin-Token", required = false) String supplied) {
-        admin.require(supplied);
+    @PostMapping("/{keyspace}")
+    public KeyspaceService.ProvisionResult provision(@PathVariable String clusterId, @PathVariable String keyspace) {
         return service.provision(clusterId, keyspace);
     }
 
-    @GetMapping("/clusters/{clusterId}/keyspaces")
-    public List<KeyspaceRecord> keyspaces(
-        @PathVariable String clusterId,
-        @RequestParam(defaultValue = "50") int limit,
-        @RequestHeader(value = "X-Admin-Token", required = false) String supplied) {
-        admin.require(supplied);
-        return service.list(clusterId, admin.validateLimit(limit));
+    @GetMapping
+    public List<KeyspaceRecord> keyspaces(@PathVariable String clusterId,
+                                          @RequestParam(defaultValue = "50") int limit) {
+        return service.list(clusterId, PageLimits.require(limit));
     }
 
-    @PostMapping("/clusters/{clusterId}/keyspaces/{keyspace}/probe")
-    public Map<String, Object> probe(
-        @PathVariable String clusterId,
-        @PathVariable String keyspace,
-        @RequestBody Probe body,
-        @RequestHeader(value = "X-Admin-Token", required = false) String supplied) {
-        admin.require(supplied);
+    @PostMapping("/{keyspace}/probe")
+    public KeyspaceService.ProbeResult probe(@PathVariable String clusterId, @PathVariable String keyspace,
+                                             @RequestBody ProbeRequest body) {
         return service.probe(clusterId, keyspace, body.value());
     }
 
-    public record Probe(String value) {
+    public record ProbeRequest(String value) {
     }
 }

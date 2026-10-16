@@ -21,11 +21,8 @@ spring:
     open-in-view: false
     hibernate:
       ddl-auto: validate
-    properties:
-      hibernate.jdbc.time_zone: UTC
 
 demo:
-  poll-interval-seconds: ${DBAAS_POLL_INTERVAL_SECONDS:20}
   contact-points: ${DBAAS_CONTACT_POINTS:127.0.0.1:9042,127.0.0.1:9043,127.0.0.1:9044}
   datacenter: ${DBAAS_DATACENTER:dc1}
   cluster:
@@ -34,17 +31,16 @@ demo:
     replication-factor: ${DBAAS_REPLICATION_FACTOR:3}
     request-timeout-seconds: ${DBAAS_REQUEST_TIMEOUT_SECONDS:10}
     reconnect-seconds: ${DBAAS_RECONNECT_SECONDS:60}
-    connection-threads: ${DBAAS_CONNECTION_THREADS:8}
   address-translation:
     enabled: ${DBAAS_ADDRESS_TRANSLATION_ENABLED:true}
     mappings: ${DBAAS_ADDRESS_TRANSLATION_MAPPINGS:172.28.91.11=127.0.0.1:9042,172.28.91.12=127.0.0.1:9043,172.28.91.13=127.0.0.1:9044}
   repair:
-    transport: ${DBAAS_REPAIR_TRANSPORT:jmx}
-    nodes: ${DBAAS_REPAIR_NODES:cassandra1,cassandra2,cassandra3}
-    command: ${DBAAS_REPAIR_COMMAND:docker compose exec -T {node} nodetool repair -pr {keyspace}}
-    lease-minutes: ${DBAAS_REPAIR_LEASE_MINUTES:60}
     worker-threads: ${DBAAS_REPAIR_WORKER_THREADS:8}
     worker-enabled: ${DBAAS_REPAIR_WORKER_ENABLED:true}
+    jmx:
+      poll-seconds: ${DBAAS_REPAIR_POLL_SECONDS:20}
+      delayed-after-seconds: ${DBAAS_REPAIR_DELAYED_AFTER_SECONDS:86400}
+      observation-deadline-seconds: ${DBAAS_REPAIR_OBSERVATION_DEADLINE_SECONDS:604800}
   provisioning-lease-seconds: ${DBAAS_PROVISIONING_LEASE_SECONDS:60}
   max-keyspaces: ${DBAAS_MAX_KEYSPACES:5}
   admin-token: ${DBAAS_ADMIN_TOKEN:local-demo-only}

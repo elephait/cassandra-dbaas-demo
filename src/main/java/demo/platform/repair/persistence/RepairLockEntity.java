@@ -1,9 +1,10 @@
 package demo.platform.repair.persistence;
 
-import jakarta.persistence.*;
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
 import lombok.NoArgsConstructor;
-import org.hibernate.annotations.JdbcTypeCode;
-import org.hibernate.type.SqlTypes;
 
 import java.time.Instant;
 
@@ -17,7 +18,6 @@ public class RepairLockEntity {
     @Column(name = "owner_id", length = 36)
     private String owner;
     @Column(name = "expires_at")
-    @JdbcTypeCode(SqlTypes.TIMESTAMP)
     private Instant expiresAt;
 
     public RepairLockEntity(String clusterId) {

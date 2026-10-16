@@ -1,8 +1,8 @@
 package demo.platform;
 
 import demo.platform.cluster.ClusterRegistryService;
-import demo.platform.misc.ApiExceptionHandler;
-import demo.platform.misc.CassandraConnectionManager;
+import demo.platform.common.PlatformProperties;
+import demo.platform.cluster.cassandra.CassandraSessions;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -17,15 +17,15 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 })
 class PlatformApplicationTest {
     @Autowired
-    private CassandraConnectionManager connections;
+    private CassandraSessions sessions;
     @Autowired
-    private ApiExceptionHandler.CassandraProperties properties;
+    private PlatformProperties properties;
     @Autowired
     private ClusterRegistryService clusters;
 
     @Test
     void startsWithoutCassandra() {
-        assertTrue(connections.currentSession(clusters.requireEnabled("default")).isEmpty());
+        assertTrue(sessions.current(clusters.requireEnabled("default")).isEmpty());
         assertEquals(60, properties.getCassandra().getReconnectSeconds());
     }
 }
